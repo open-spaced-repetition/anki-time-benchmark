@@ -33,8 +33,6 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 
 Total number of collections (each from one Anki user): 10,000.
 
-Total number of reviews for evaluation: _________.
-
 Below are two tables. In one of them reviews where the time is **precisely** 15.000 seconds, 30.000 seconds, 60.000 seconds, 120.000 seconds, etc. are excluded. In the second table they are included.
 This is due to Anki's feature ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) capping review time, meaning that 60.000 seconds could have been anything from 60.001 seconds to many hours.
 
@@ -42,6 +40,9 @@ Additionally, all reviews that took >30 minutes are excluded, though they are a 
 
 ### With filtering
 
+Total number of reviews for evaluation: _________.
 
 ### Without filtering
+
+Total number of reviews for evaluation: _________.
 
