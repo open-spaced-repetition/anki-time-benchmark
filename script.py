@@ -16,9 +16,8 @@ Supported methods (select via --method):
 
 Notes:
 - duration in parquet is milliseconds, converted to seconds with 3 decimals.
-- censored durations are excluded from BOTH train and test:
-  15.000, 30.000, 60.000, 120.000, 180.000, ...
-  (implemented in ms: 15000, 30000, and all n*60000 for integer n>=1)
+- censored durations are excluded from BOTH train and test by iteratively finding the mode
+and removing all values equal to if if that mode has .000 seconds (i.e., ms % 1000 == 0)
 - zero/non-positive duration rows are dropped.
 """
 
@@ -135,9 +134,38 @@ def build_config(args: argparse.Namespace) -> Config:
 # ── data loading / preprocessing ──────────────────────────────────────────────
 
 
-def _is_censored_duration_ms(ms: pd.Series) -> pd.Series:
-    ms_i = ms.astype("int64")
-    return ms_i.isin([15000, 30000]) | ((ms_i >= 60000) & (ms_i % 60000 == 0))
+def _drop_iterative_capped_modes(df: pd.DataFrame, duration_col: str = "duration") -> pd.DataFrame:
+    """
+    Iteratively:
+      1) find the mode duration value
+      2) if that mode has .000 seconds (i.e., ms % 1000 == 0), remove all rows with that value
+    Stop when:
+      - no duplicate mode remains (mode frequency <= 1), or
+      - mode is not xxx.000 seconds.
+    """
+    out = df.copy()
+
+    while len(out) > 0:
+        vc = out[duration_col].value_counts(dropna=False)
+        if vc.empty:
+            break
+
+        top_freq = int(vc.iloc[0])
+        if top_freq <= 1:
+            # No repeated value left -> no meaningful "capped mode" to remove
+            break
+
+        # Deterministic tie-break if multiple modes: pick smallest value
+        mode_candidates = vc[vc == top_freq].index.to_numpy(dtype="int64")
+        mode_val = int(np.min(mode_candidates))
+
+        # ".000 seconds" <=> integer milliseconds divisible by 1000
+        if mode_val % 1000 != 0:
+            break
+
+        out = out[out[duration_col] != mode_val].copy()
+
+    return out
 
 def _is_inadequate_exception(e: Exception) -> bool:
     s = str(e).lower()
@@ -175,9 +203,11 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     raw["duration"] = raw["duration"].astype("int64")
 
     non_positive = raw["duration"] <= 0
-    censored = _is_censored_duration_ms(raw["duration"])
     afk_too_long = raw["duration"] > 1_800_000  # > 30 min in ms
-    raw = raw[~non_positive & ~censored & ~afk_too_long].copy()
+    raw = raw[~non_positive & ~afk_too_long].copy()
+
+    # Iteratively remove repeated modal values that are exact xxx.000 seconds
+    raw = _drop_iterative_capped_modes(raw, duration_col="duration")
 
     raw["duration_sec"] = (raw["duration"] / 1000.0).round(3)
     raw = raw.sort_values("event_id").copy()
