@@ -1,6 +1,11 @@
 """
 Benchmark review-time prediction methods on Anki revlogs.
 
+This refactor uses duration-regression metrics:
+- MAE
+- RMSE
+- MAPE
+
 Supported methods (select via --method):
 - const                   : global constant 7s
 - user_median             : user median from train split
@@ -11,9 +16,7 @@ Supported methods (select via --method):
 
 Notes:
 - duration in parquet is milliseconds, converted to seconds with 3 decimals.
-- censored durations are excluded from train/test evaluation targets by iteratively
-  finding the mode and removing it when it is exactly xxx.000 seconds (ms % 1000 == 0).
-- zero/non-positive duration rows are dropped from evaluation targets.
+- censored (capped) durations are excluded
 - FSRS feature generation/training uses unfiltered-by-duration review history.
 """
 
@@ -130,35 +133,45 @@ def build_config(args: argparse.Namespace) -> Config:
 # ── data loading / preprocessing ──────────────────────────────────────────────
 
 
-def _drop_iterative_capped_modes(df: pd.DataFrame, duration_col: str = "duration") -> pd.DataFrame:
+def _drop_frequency_jump_tail(
+    df: pd.DataFrame,
+    duration_col: str = "duration",
+    jump_ratio: float = 10.0,
+    require_whole_seconds: bool = False,  # optional safety
+) -> pd.DataFrame:
     """
-    Iteratively:
-      1) find the mode duration value
-      2) if that mode has .000 seconds (i.e., ms % 1000 == 0), remove all rows with that value
-    Stop when:
-      - no duplicate mode remains (mode frequency <= 1), or
-      - mode is not xxx.000 seconds.
+    1) Count frequency of each duration value.
+    2) Sort frequencies ascending: x[0] <= x[1] <= ... <= x[n-1].
+    3) Find last j such that x[j] * jump_ratio <= x[j+1].
+    4) Remove all duration values whose frequency is in the tail x[j+1:].
+
+    If no such jump exists, returns original df.
     """
     out = df.copy()
+    vc = out[duration_col].value_counts(dropna=False)  # index=duration, value=count
+    if vc.empty or len(vc) < 2:
+        return out
 
-    while len(out) > 0:
-        vc = out[duration_col].value_counts(dropna=False)
-        if vc.empty:
-            break
+    # sort by frequency ascending
+    vc_sorted = vc.sort_values(kind="stable")
+    counts = vc_sorted.to_numpy(dtype=np.int64)
 
-        top_freq = int(vc.iloc[0])
-        if top_freq <= 1:
-            break
+    # find all jump positions
+    jump_pos = np.where(counts[:-1] * jump_ratio <= counts[1:])[0]
+    if len(jump_pos) == 0:
+        return out
 
-        mode_candidates = vc[vc == top_freq].index.to_numpy(dtype="int64")
-        mode_val = int(np.min(mode_candidates))
+    j = int(jump_pos[-1])  # last occurrence
+    tail_values = vc_sorted.index[(j + 1):]  # durations to drop
 
-        if mode_val % 1000 != 0:
-            break
+    if require_whole_seconds:
+        # keep only tail values that are exact whole-second durations (ms % 1000 == 0)
+        tail_values = [v for v in tail_values if (int(v) % 1000 == 0)]
 
-        out = out[out[duration_col] != mode_val].copy()
+    if len(tail_values) == 0:
+        return out
 
-    return out
+    return out[~out[duration_col].isin(tail_values)].copy()
 
 
 def _is_inadequate_exception(e: Exception) -> bool:
@@ -253,7 +266,12 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     afk_too_long = eval_df["duration"] > 1_800_000  # > 30 min in ms
     eval_df = eval_df[~non_positive & ~afk_too_long].copy()
 
-    eval_df = _drop_iterative_capped_modes(eval_df, duration_col="duration")
+    eval_df = _drop_frequency_jump_tail(
+        eval_df,
+        duration_col="duration",
+        jump_ratio=10.0,
+        require_whole_seconds=True,  # recommended safety
+    )
 
     eval_df["duration_sec"] = (eval_df["duration"] / 1000.0).round(3)
     eval_df = eval_df.merge(partition_map, on="event_id", how="left")
