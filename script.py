@@ -1,11 +1,6 @@
 """
 Benchmark review-time prediction methods on Anki revlogs.
 
-This refactor uses duration-regression metrics:
-- MAE
-- RMSE
-- MAPE
-
 Supported methods (select via --method):
 - const                   : global constant 7s
 - user_median             : user median from train split
