@@ -31,7 +31,7 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 
 ## Result
 
-Total number of collections (each from one Anki user): 9,9994.
+Total number of collections (each from one Anki user): 9,994.
 
 Total number of reviews for evaluation: 572,307,825.
 
