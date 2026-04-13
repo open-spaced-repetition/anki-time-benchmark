@@ -53,6 +53,7 @@ from review_time_nn import (
 )
 
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 METHOD_NAMES = {
