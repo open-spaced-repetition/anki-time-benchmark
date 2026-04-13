@@ -26,7 +26,7 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
 4) grade_median_8: median time for Again/Hard/Good/Easy, with the first review receiving special treatment and having its own values. 8 numbers per user. This method is currently used in Anki's simulator.
 5) fsrs_r_linear: first review -> first-grade median, else `t=b+a*R`. Here R is probability of recall predicted by FSRS-7.
-6) fsrs_r_grade_interact: first review -> first-grade median, else `t=a0+a1*g+a2*R+a3*g*R`, where G (grade) can be 1, 2, 3, 4. 
+6) fsrs_r_grade_interact: first review -> first-grade median, else `t=a0+a1*G+a2*R+a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. 
 
 
 ## Result
