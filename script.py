@@ -7,6 +7,7 @@ Methods:
 - grade_median_4
 - grade_median_8
 - fsrs_r_linear
+- fsrs_r_linear_robust
 - fsrs_r_grade_interact
 - fsrs_dsr_grade_nn
 
@@ -38,6 +39,7 @@ import pyarrow.parquet as pq  # type: ignore
 import torch
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
+from scipy.stats import siegelslopes  # type: ignore
 from torch import Tensor, nn
 from tqdm.auto import tqdm  # type: ignore
 
@@ -62,6 +64,7 @@ METHOD_NAMES = {
     "grade_median_4": "GRADE_MEDIAN_4",
     "grade_median_8": "GRADE_MEDIAN_8",
     "fsrs_r_linear": "FSRS7_R_LINEAR",
+    "fsrs_r_linear_robust": "FSRS7_R_LINEAR_ROBUST",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
 }
@@ -245,7 +248,7 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     eval_df = eval_df.dropna(subset=["duration"]).copy()
     eval_df["duration"] = eval_df["duration"].astype("int64")
 
-    eval_df = eval_df[(eval_df["duration"] > 0) & (eval_df["duration"] <= 1_800_000)].copy()
+    eval_df = eval_df[(eval_df["duration"] > 0) & (eval_df["duration"] <= 1_800_000)].copy()  # 30 minutes
     eval_df = _drop_frequency_jump_tail(
         eval_df,
         duration_col="duration",
@@ -439,6 +442,44 @@ def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np
         pred.append(first_map[g] if bool(row["first_review"]) else non_first_map[g])
     return np.array(pred, dtype=float)
 
+def _predict_fsrs_r_linear_robust(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_R_map: dict[int, float],
+    test_R_map: dict[int, float],
+) -> np.ndarray:
+    global_med = float(train_eval["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(train_eval), global_med)
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["R"] = non_first_df["event_id"].map(train_R_map)
+    fit_df = non_first_df.dropna(subset=["R"]).copy()
+
+    if len(fit_df) >= 2:
+        x = fit_df["R"].to_numpy(dtype=float)
+        y = fit_df["duration_sec"].to_numpy(dtype=float)
+        # scipy.stats.siegelslopes uses (y, x), not (x, y)
+        slope, intercept, _, _ = siegelslopes(y, x)
+        a, b = float(slope), float(intercept)
+    else:
+        a, b = 0.0, global_med
+
+    non_first_map_raw = train_eval[~train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            R = test_R_map.get(int(row["event_id"]))
+            t = non_first_map[g] if R is None else a * float(R) + b
+        pred.append(max(0.0, float(t)))
+    return np.array(pred, dtype=float)
 
 def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
@@ -926,11 +967,13 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         elif config.method == "grade_median_8":
             pred = _predict_grade_median_8(train_eval, test_eval)
 
-        elif config.method in ("fsrs_r_linear", "fsrs_r_grade_interact"):
+        elif config.method in ("fsrs_r_linear", "fsrs_r_linear_robust", "fsrs_r_grade_interact"):
             train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
             last_algorithm_weights = weights if weights else last_algorithm_weights
             if config.method == "fsrs_r_linear":
                 pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
+            elif config.method == "fsrs_r_linear_robust":
+                pred = _predict_fsrs_r_linear_robust(train_eval, test_eval, train_R_map, test_R_map)
             else:
                 pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
 
@@ -984,6 +1027,7 @@ def _parse_args() -> argparse.Namespace:
             "grade_median_4",
             "grade_median_8",
             "fsrs_r_linear",
+            "fsrs_r_linear_robust",
             "fsrs_r_grade_interact",
             "fsrs_dsr_grade_nn",
         ],
