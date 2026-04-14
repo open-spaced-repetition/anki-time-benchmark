@@ -96,11 +96,7 @@ class Config:
     nn_finetune_batch_size: int = 512
 
     train_equals_test: bool = False
-    no_test_same_day: bool = False
-    no_train_same_day: bool = False
     with_first_reviews: bool = False
-
-    partitions: str = "none"
 
     s_min: float = 0.0001
     init_s_max: float = 100.0
@@ -127,14 +123,11 @@ def build_config(args: argparse.Namespace) -> Config:
         seed=args.seed,
         default_params=args.default_params,
         use_recency_weighting=args.recency_weighting,
-        partitions=args.partitions,
         save_evaluation_file=args.save_evaluation_file,
         save_raw_output=args.save_raw_output,
         save_weights=args.save_weights,
         verbose_inadequate_data=args.verbose,
         num_processes=args.processes,
-        no_test_same_day=args.no_test_same_day,
-        no_train_same_day=args.no_train_same_day,
         with_first_reviews=args.with_first_reviews,
         nn_ckpt_path=Path(args.nn_ckpt),
         nn_pretrain_users=args.nn_pretrain_users,
@@ -187,39 +180,6 @@ def _is_inadequate_exception(e: Exception) -> bool:
     )
 
 
-def _build_partition_map(raw_base: pd.DataFrame, user_id: int, config: Config) -> pd.DataFrame:
-    out = raw_base[["event_id"]].copy()
-
-    if config.partitions == "none":
-        out["partition"] = 0
-        return out
-
-    df_cards = pd.read_parquet(
-        config.data_path / "cards",
-        filters=[("user_id", "=", user_id)],
-        columns=["user_id", "card_id", "deck_id"],
-    ).drop(columns=["user_id"], errors="ignore")
-
-    tmp = raw_base[["event_id", "card_id"]].merge(
-        df_cards.drop_duplicates("card_id"),
-        on="card_id",
-        how="left",
-    )
-
-    if config.partitions == "deck":
-        tmp["partition"] = tmp["deck_id"].fillna(-1).astype(int)
-    else:
-        df_decks = pd.read_parquet(
-            config.data_path / "decks",
-            filters=[("user_id", "=", user_id)],
-            columns=["user_id", "deck_id", "preset_id"],
-        ).drop(columns=["user_id"], errors="ignore")
-        tmp = tmp.merge(df_decks.drop_duplicates("deck_id"), on="deck_id", how="left")
-        tmp["partition"] = tmp["preset_id"].fillna(-1).astype(int)
-
-    return tmp[["event_id", "partition"]]
-
-
 def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     raw = pd.read_parquet(config.data_path / "revlogs" / f"user_id={user_id}").copy()
     raw = raw[raw["rating"].isin([1, 2, 3, 4])].copy()
@@ -236,12 +196,9 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     raw = raw[raw["i_raw"] <= config.max_seq_len * 2].copy()
 
     raw_base = raw.sort_values("event_id").copy()
-    partition_map = _build_partition_map(raw_base, user_id, config)
 
     algorithm_input = raw_base.copy()
     algorithm_df = create_features(algorithm_input, config)
-    algorithm_df = algorithm_df.merge(partition_map, on="event_id", how="left")
-    algorithm_df["partition"] = algorithm_df["partition"].fillna(-1).astype(int)
 
     eval_df = raw_base.copy()
     eval_df["duration"] = pd.to_numeric(eval_df["duration"], errors="coerce")
@@ -257,8 +214,6 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     )
 
     eval_df["duration_sec"] = (eval_df["duration"] / 1000.0).round(3)
-    eval_df = eval_df.merge(partition_map, on="event_id", how="left")
-    eval_df["partition"] = eval_df["partition"].fillna(-1).astype(int)
     eval_df = eval_df.sort_values("event_id").copy()
 
     if len(eval_df) < 6:
@@ -409,15 +364,13 @@ def _fill_grade_medians(base: dict[int, float], fallback: float) -> dict[int, fl
 
 
 def _duration_training_scope(train_df: pd.DataFrame, with_first_reviews: bool) -> pd.DataFrame:
-    """
-    Keep training statistics conceptually aligned with evaluation policy:
-    - with_first_reviews=True  -> use all training rows
-    - with_first_reviews=False -> use non-first rows only (fallback to all if empty)
-    """
     if with_first_reviews:
         return train_df
+
     non_first = train_df[~train_df["first_review"]].copy()
-    return non_first if len(non_first) > 0 else train_df
+    if len(non_first) == 0:
+        raise Exception("No non-first training rows; skip this split.")
+    return non_first
 
 
 def _predict_const7(test_df: pd.DataFrame) -> np.ndarray:
@@ -438,8 +391,6 @@ def _predict_grade_median_4(train_df: pd.DataFrame, test_df: pd.DataFrame, with_
 
 
 def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame, with_first_reviews: bool) -> np.ndarray:
-    # Required equivalence:
-    # When first reviews are excluded from evaluation, force exact behavioral parity with grade_median_4.
     if not with_first_reviews:
         return _predict_grade_median_4(train_df, test_df, with_first_reviews=False)
 
@@ -467,40 +418,35 @@ def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     return coef
 
 
-def _fit_algorithm_partition_weights(train_algorithm_df: pd.DataFrame, config: Config) -> dict[int, list]:
-    partition_weights: dict[int, list] = {}
-    for partition in train_algorithm_df["partition"].unique():
-        train_partition = train_algorithm_df[train_algorithm_df["partition"] == partition].copy()
-        if len(train_partition) == 0:
-            continue
+def _fit_algorithm_weights(train_algorithm_df: pd.DataFrame, config: Config) -> list:
+    if len(train_algorithm_df) == 0:
+        return FSRS7(config).state_dict()
 
-        if config.use_recency_weighting:
-            x = np.linspace(0, 1, len(train_partition))
-            train_partition["weights"] = 0.25 + 0.75 * np.power(x, 3)
+    train_alg = train_algorithm_df.copy()
 
-        algorithm = FSRS7(config).to(config.device)
+    if config.use_recency_weighting:
+        x = np.linspace(0, 1, len(train_alg))
+        train_alg["weights"] = 0.25 + 0.75 * np.power(x, 3)
 
-        if config.default_params:
-            partition_weights[int(partition)] = algorithm.state_dict()
-            continue
+    algorithm = FSRS7(config).to(config.device)
 
-        try:
-            trainer = AlgorithmTrainer(
-                algorithm=algorithm,
-                train_set=train_partition,
-                batch_size=config.batch_size,
-                max_seq_len=config.max_seq_len,
-            )
-            partition_weights[int(partition)] = trainer.train()
-        except Exception as e:
-            if _is_inadequate_exception(e):
-                if config.verbose_inadequate_data:
-                    tqdm.write(f"Skipping partition {partition} due to inadequate data.")
-                partition_weights[int(partition)] = FSRS7(config).state_dict()
-            else:
-                raise
+    if config.default_params:
+        return algorithm.state_dict()
 
-    return partition_weights
+    try:
+        trainer = AlgorithmTrainer(
+            algorithm=algorithm,
+            train_set=train_alg,
+            batch_size=config.batch_size,
+            max_seq_len=config.max_seq_len,
+        )
+        return trainer.train()
+    except Exception as e:
+        if _is_inadequate_exception(e):
+            if config.verbose_inadequate_data:
+                tqdm.write("Training data inadequate; using default FSRS parameters.")
+            return FSRS7(config).state_dict()
+        raise
 
 
 def _predict_DSR_maps(
@@ -511,24 +457,21 @@ def _predict_DSR_maps(
     if len(train_algorithm_df) == 0:
         return {}, {}
 
-    weights = _fit_algorithm_partition_weights(train_algorithm_df, config)
+    w = _fit_algorithm_weights(train_algorithm_df, config)
+    algorithm = FSRS7(config, w=w).to(config.device)
+
     train_map: dict[int, tuple[float, float, float]] = {}
     test_map: dict[int, tuple[float, float, float]] = {}
 
-    for partition, w in weights.items():
-        algorithm = FSRS7(config, w=w).to(config.device)
+    if len(train_algorithm_df) > 0:
+        d, s, r = batch_predict_dsr(algorithm, train_algorithm_df, config)
+        for eid, dd, ss, rr in zip(train_algorithm_df["event_id"].tolist(), d, s, r):
+            train_map[int(eid)] = (float(dd), float(ss), float(rr))
 
-        tr_part = train_algorithm_df[train_algorithm_df["partition"] == partition].copy()
-        if len(tr_part) > 0:
-            d, s, r = batch_predict_dsr(algorithm, tr_part, config)
-            for eid, dd, ss, rr in zip(tr_part["event_id"].tolist(), d, s, r):
-                train_map[int(eid)] = (float(dd), float(ss), float(rr))
-
-        te_part = test_algorithm_df[test_algorithm_df["partition"] == partition].copy()
-        if len(te_part) > 0:
-            d, s, r = batch_predict_dsr(algorithm, te_part, config)
-            for eid, dd, ss, rr in zip(te_part["event_id"].tolist(), d, s, r):
-                test_map[int(eid)] = (float(dd), float(ss), float(rr))
+    if len(test_algorithm_df) > 0:
+        d, s, r = batch_predict_dsr(algorithm, test_algorithm_df, config)
+        for eid, dd, ss, rr in zip(test_algorithm_df["event_id"].tolist(), d, s, r):
+            test_map[int(eid)] = (float(dd), float(ss), float(rr))
 
     return train_map, test_map
 
@@ -537,30 +480,27 @@ def _predict_R_maps(
     train_algorithm_df: pd.DataFrame,
     test_algorithm_df: pd.DataFrame,
     config: Config,
-) -> tuple[dict[int, float], dict[int, float], dict[int, list]]:
+) -> tuple[dict[int, float], dict[int, float], list]:
     if len(train_algorithm_df) == 0:
-        return {}, {}, {}
+        return {}, {}, FSRS7(config).state_dict()
 
-    weights = _fit_algorithm_partition_weights(train_algorithm_df, config)
+    w = _fit_algorithm_weights(train_algorithm_df, config)
+    algorithm = FSRS7(config, w=w).to(config.device)
+
     train_map: dict[int, float] = {}
     test_map: dict[int, float] = {}
 
-    for partition, w in weights.items():
-        algorithm = FSRS7(config, w=w).to(config.device)
+    if len(train_algorithm_df) > 0:
+        r_train = batch_predict_retention(algorithm, train_algorithm_df, config)
+        for eid, r in zip(train_algorithm_df["event_id"].tolist(), r_train):
+            train_map[int(eid)] = float(r)
 
-        tr_part = train_algorithm_df[train_algorithm_df["partition"] == partition].copy()
-        if len(tr_part) > 0:
-            r_train = batch_predict_retention(algorithm, tr_part, config)
-            for eid, r in zip(tr_part["event_id"].tolist(), r_train):
-                train_map[int(eid)] = float(r)
+    if len(test_algorithm_df) > 0:
+        r_test = batch_predict_retention(algorithm, test_algorithm_df, config)
+        for eid, r in zip(test_algorithm_df["event_id"].tolist(), r_test):
+            test_map[int(eid)] = float(r)
 
-        te_part = test_algorithm_df[test_algorithm_df["partition"] == partition].copy()
-        if len(te_part) > 0:
-            r_test = batch_predict_retention(algorithm, te_part, config)
-            for eid, r in zip(te_part["event_id"].tolist(), r_test):
-                test_map[int(eid)] = float(r)
-
-    return train_map, test_map, weights
+    return train_map, test_map, w
 
 
 def _predict_fsrs_r_linear(
@@ -673,23 +613,14 @@ def _build_pretrain_nn_state(config: Config) -> dict:
             if len(algorithm_df) == 0:
                 continue
 
-            # Fit FSRS per user (and per partition, if enabled) on full user history
-            weights = _fit_algorithm_partition_weights(algorithm_df, config)
+            w = _fit_algorithm_weights(algorithm_df, config)
+            algo = FSRS7(config, w=w).to(config.device)
+            d, s, r = batch_predict_dsr(algo, algorithm_df, config)
 
-            # Predict DSR using fitted FSRS weights
             dsr_map: dict[int, tuple[float, float, float]] = {}
-            for partition, w in weights.items():
-                part_df = algorithm_df[algorithm_df["partition"] == partition].copy()
-                if len(part_df) == 0:
-                    continue
+            for eid, dd, ss, rr in zip(algorithm_df["event_id"].tolist(), d, s, r):
+                dsr_map[int(eid)] = (float(dd), float(ss), float(rr))
 
-                algo = FSRS7(config, w=w).to(config.device)
-                d, s, r = batch_predict_dsr(algo, part_df, config)
-
-                for eid, dd, ss, rr in zip(part_df["event_id"].tolist(), d, s, r):
-                    dsr_map[int(eid)] = (float(dd), float(ss), float(rr))
-
-            # Build NN samples from non-first reviews only
             rows = eval_df[~eval_df["first_review"]].copy()
             rows["dsr"] = rows["event_id"].map(dsr_map)
             rows = rows.dropna(subset=["dsr"])
@@ -849,7 +780,7 @@ def evaluate(
     y_pred: list[float],
     user_id: int,
     config: Config,
-    algorithm_weights_last_split: Optional[dict[int, list]] = None,
+    algorithm_weights_last_split: Optional[list] = None,
 ) -> tuple[dict, Optional[dict]]:
     y = np.array(y_true, dtype=float)
     p = np.array(y_pred, dtype=float)
@@ -860,12 +791,11 @@ def evaluate(
         "size": int(len(y_true)),
     }
 
-    if config.save_weights and algorithm_weights_last_split:
-        stats["algorithm_parameters"] = {
-            int(partition): list(map(lambda x: round(float(x), 6), w))
-            for partition, w in algorithm_weights_last_split.items()
-            if isinstance(w, list)
-        }
+    if config.save_weights and algorithm_weights_last_split is not None:
+        if isinstance(algorithm_weights_last_split, list):
+            stats["algorithm_parameters"] = [round(float(x), 6) for x in algorithm_weights_last_split]
+        else:
+            stats["algorithm_parameters"] = algorithm_weights_last_split
 
     raw: Optional[dict] = None
     if config.save_raw_output:
@@ -910,12 +840,14 @@ def _catch(func):
 @_catch
 def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tuple[dict, Optional[dict]]:
     eval_df, algorithm_df = load_user_frames(user_id, config)
+    if not config.with_first_reviews and (~eval_df["first_review"]).sum() == 0:
+        raise Exception(f"{user_id}: only first reviews; skipping user.")
 
     tscv = TimeSeriesSplit(n_splits=config.n_splits)
     y_all: list[float] = []
     p_all: list[float] = []
     save_tmp: list[pd.DataFrame] = []
-    last_algorithm_weights: Optional[dict[int, list]] = None
+    last_algorithm_weights: Optional[list] = None
 
     for _, (train_idx, test_idx) in enumerate(tscv.split(eval_df)):
         if not config.train_equals_test:
@@ -925,22 +857,21 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
             train_eval = eval_df.copy()
             test_eval = eval_df.iloc[test_idx].copy()
 
-        if config.no_test_same_day:
-            test_eval = test_eval[test_eval["elapsed_days"] > 0].copy()
-        if config.no_train_same_day:
-            train_eval = train_eval[train_eval["elapsed_days"] > 0].copy()
-
         if len(train_eval) == 0 or len(test_eval) == 0:
             continue
 
-        train_end = int(train_eval["event_id"].max())
-        test_start = int(test_eval["event_id"].min())
-        test_end = int(test_eval["event_id"].max())
+        if not config.with_first_reviews and (~train_eval["first_review"]).sum() == 0:
+            continue
 
-        train_algorithm_df = algorithm_df[algorithm_df["event_id"] <= train_end].copy()
-        test_algorithm_df = algorithm_df[
-            (algorithm_df["event_id"] >= test_start) & (algorithm_df["event_id"] <= test_end)
-        ].copy()
+        # Keep FSRS memory state consistent:
+        # train on all algorithm events strictly before first test event,
+        # so filtered eval gaps do not erase history.
+        first_test_event = int(test_eval["event_id"].min())
+        train_algorithm_df = algorithm_df[algorithm_df["event_id"] < first_test_event].copy()
+
+        # Predict only on algorithm rows that correspond to actual test_eval events.
+        test_event_ids = set(test_eval["event_id"].tolist())
+        test_algorithm_df = algorithm_df[algorithm_df["event_id"].isin(test_event_ids)].copy()
 
         if config.method == "const":
             pred = _predict_const7(test_eval)
@@ -1042,9 +973,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--default-params", dest="default_params", action="store_true")
     p.add_argument("--recency-weighting", dest="recency_weighting", action="store_true")
-    p.add_argument("--partitions", default="none", choices=["none", "preset", "deck"])
-    p.add_argument("--no-test-same-day", dest="no_test_same_day", action="store_true")
-    p.add_argument("--no-train-same-day", dest="no_train_same_day", action="store_true")
     p.add_argument("--with_first_reviews", action="store_true")
     p.add_argument("--save-evaluation-file", dest="save_evaluation_file", action="store_true")
     p.add_argument("--save-raw", dest="save_raw_output", action="store_true")
