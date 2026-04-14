@@ -36,7 +36,7 @@ Total number of collections (each from one Anki user): 9,994.
 
 Total number of reviews for evaluation: 572,307,825.
 
-Due to Anki's ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) setting capping review time, reviews with capped time are excluded. Additionally, reviews that took >30 minutes are excluded, though they are a small minority of all reviews. 6 users were excluded due to not having valid data after filtering.
+Due to Anki's ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) setting capping review time, reviews with capped time are excluded. 6 users were excluded due to not having valid data after filtering.
 
 The best result for each metric is highlighted in **bold**.
 
