@@ -24,25 +24,20 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 1) const: a hard-coded constant time. Currently, 7 seconds is used.
 2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One number per user.
 3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
-4) grade_median_8: median time for Again/Hard/Good/Easy, with the first review receiving special treatment and having its own values. 8 numbers per user. This method is currently used in Anki's simulator.
-5) fsrs_r_linear: first review -> first-grade median, else `t=b+a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
-6) fsrs_r_grade_interact: first review -> first-grade median, else `t=a0+a1*G+a2*R+a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
-7) fsrs_dsr_grade_nn: first review -> first-grade median, else a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
+5) fsrs_r_linear: t=b+a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
+6) fsrs_r_grade_interact: `t=a0+a1*G+a2*R+a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
+7) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
 
 
 ## Result
 
 Total number of collections (each from one Anki user): 9,994.
 
-Total number of reviews for evaluation: 572,307,825.
+Total number of reviews for evaluation: _________.
 
-Due to Anki's ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) setting capping review time, reviews with capped time are excluded. 6 users were excluded due to not having valid data after filtering.
+Due to Anki's ["Maximum answer seconds"](https://docs.ankiweb.net/deck-options.html#timers) setting capping review time, reviews with capped time are excluded. 6 users were excluded due to not having valid data after filtering. Additionally, firts reviews are excluded. Time spent on reviewing a card for the first time appears to be sufficiently different from time of the following reviews.
 
 The best result for each metric is highlighted in **bold**.
 
 | Method | RMSE | MAE | MAPE |
 | --- | --- | --- | --- |
-| GRADE_MEDIAN_8 | **13.77±0.46 s** | **7.13±0.20 s** | **117%±15%** |
-| GRADE_MEDIAN_4 | 13.80±0.46 s | 7.15±0.20 s | 118%±15% |
-| USER_MEDIAN | 14.03±0.46 s | 7.31±0.21 s | 123%±17% |
-| CONST | 14.64±0.46 s | 8.03±0.18 s | 158%±21% |
