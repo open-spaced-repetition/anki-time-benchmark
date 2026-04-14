@@ -462,7 +462,7 @@ def _predict_fsrs_r_linear_robust(
         x = fit_df["R"].to_numpy(dtype=float)
         y = fit_df["duration_sec"].to_numpy(dtype=float)
         # scipy.stats.siegelslopes uses (y, x), not (x, y)
-        slope, intercept, _, _ = siegelslopes(y, x)
+        siegel_result = siegelslopes(y, x)
         a, b = float(slope), float(intercept)
     else:
         a, b = 0.0, global_med
