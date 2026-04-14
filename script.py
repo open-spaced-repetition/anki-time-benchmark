@@ -7,7 +7,6 @@ Methods:
 - grade_median_4
 - grade_median_8
 - fsrs_r_linear
-- fsrs_r_linear_robust
 - fsrs_r_grade_interact
 - fsrs_dsr_grade_nn
 
@@ -36,7 +35,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import siegelslopes  # type: ignore
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 from torch import Tensor, nn
@@ -63,7 +61,6 @@ METHOD_NAMES = {
     "grade_median_4": "GRADE_MEDIAN_4",
     "grade_median_8": "GRADE_MEDIAN_8",
     "fsrs_r_linear": "FSRS7_R_LINEAR",
-    "fsrs_r_linear_robust": "FSRS7_R_LINEAR_ROBUST",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
 }
@@ -101,7 +98,7 @@ class Config:
     no_test_same_day: bool = False
     no_train_same_day: bool = False
 
-    # NEW: default False means first reviews are excluded from evaluation
+    # default False = first reviews excluded from evaluation
     include_first_review_in_eval: bool = False
 
     partitions: str = "none"
@@ -121,12 +118,18 @@ class Config:
         first_tag = "INCL_FIRST_REVIEW_EVAL" if self.include_first_review_in_eval else "EXCL_FIRST_REVIEW_EVAL"
         return f"{base}_{first_tag}"
 
+    def get_output_stem(self) -> str:
+        # Keep filenames consistent with first-review eval setting.
+        return self.get_evaluation_file_name()
+
 
 def build_config(args: argparse.Namespace) -> Config:
+    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     return Config(
         data_path=Path(args.data),
         max_user_id=args.max_user_id,
         method=args.method,
+        device=device,
         batch_size=args.batch_size,
         n_splits=args.n_splits,
         seed=args.seed,
@@ -267,7 +270,6 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     eval_df["partition"] = eval_df["partition"].fillna(-1).astype(int)
     eval_df = eval_df.sort_values("event_id").copy()
 
-    # NEW: first-review inclusion/exclusion for evaluation
     if not config.include_first_review_in_eval:
         eval_df = eval_df[~eval_df["first_review"]].copy()
 
@@ -453,46 +455,6 @@ def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np
         g = int(row["rating"])
         pred.append(first_map[g] if bool(row["first_review"]) else non_first_map[g])
     return np.array(pred, dtype=float)
-
-
-def _predict_fsrs_r_linear_robust(
-    train_eval: pd.DataFrame,
-    test_eval: pd.DataFrame,
-    train_R_map: dict[int, float],
-    test_R_map: dict[int, float],
-) -> np.ndarray:
-    global_med = float(train_eval["duration_sec"].median())
-    by_grade_all = _fill_grade_medians(_median_by_grade(train_eval), global_med)
-
-    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
-    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
-
-    non_first_df = train_eval[~train_eval["first_review"]].copy()
-    non_first_df["R"] = non_first_df["event_id"].map(train_R_map)
-    fit_df = non_first_df.dropna(subset=["R"]).copy()
-
-    if len(fit_df) >= 2:
-        x = fit_df["R"].to_numpy(dtype=float)
-        y = fit_df["duration_sec"].to_numpy(dtype=float)
-        siegel_result = siegelslopes(y, x)
-        a, b = float(siegel_result.slope), float(siegel_result.intercept)
-    else:
-        a, b = 0.0, global_med
-
-    non_first_map_raw = train_eval[~train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
-    non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
-
-    pred = []
-    for _, row in test_eval.iterrows():
-        g = int(row["rating"])
-        if bool(row["first_review"]):
-            t = first_map[g]
-        else:
-            R = test_R_map.get(int(row["event_id"]))
-            t = non_first_map[g] if R is None else a * float(R) + b
-        pred.append(max(0.0, float(t)))
-    return np.array(pred, dtype=float)
-
 
 def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
@@ -709,6 +671,7 @@ def _build_pretrain_nn_state(config: Config) -> dict:
                 if len(part_df) == 0:
                     continue
 
+                    # noqa: E701
                 algo = FSRS7(config, w=w).to(config.device)
                 d, s, r = batch_predict_dsr(algo, part_df, config)
 
@@ -909,12 +872,24 @@ def save_evaluation_file(user_id: int, df: pd.DataFrame, config: Config) -> None
 
 
 def sort_jsonl(file: Path) -> list:
+    if not file.exists():
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("", encoding="utf-8")
+        return []
+
     data = [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
     data.sort(key=lambda x: x["user"])
     with file.open("w", encoding="utf-8", newline="\n") as f:
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
     return data
+
+
+def write_jsonl(file: Path, items: list[dict]) -> None:
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with file.open("w", encoding="utf-8", newline="\n") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def _catch(func):
@@ -979,111 +954,93 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         elif config.method == "grade_median_8":
             pred = _predict_grade_median_8(train_eval, test_eval)
 
-        elif config.method in {"fsrs_r_linear", "fsrs_r_linear_robust", "fsrs_r_grade_interact"}:
-            train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
-            last_algorithm_weights = weights
+        elif config.method == "fsrs_r_linear":
+            train_R_map, test_R_map, last_algorithm_weights = _predict_R_maps(
+                train_algorithm_df, test_algorithm_df, config
+            )
+            pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
 
-            if config.method == "fsrs_r_linear":
-                pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
-            elif config.method == "fsrs_r_linear_robust":
-                pred = _predict_fsrs_r_linear_robust(train_eval, test_eval, train_R_map, test_R_map)
-            else:
-                pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
+        elif config.method == "fsrs_r_grade_interact":
+            train_R_map, test_R_map, last_algorithm_weights = _predict_R_maps(
+                train_algorithm_df, test_algorithm_df, config
+            )
+            pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
 
         elif config.method == "fsrs_dsr_grade_nn":
             if nn_state is None:
-                raise RuntimeError("nn_state is required for fsrs_dsr_grade_nn.")
+                raise RuntimeError("nn_state is required for fsrs_dsr_grade_nn")
             train_dsr_map, test_dsr_map = _predict_DSR_maps(train_algorithm_df, test_algorithm_df, config)
             pred = _predict_fsrs_dsr_grade_nn(
-                train_eval,
-                test_eval,
-                train_dsr_map,
-                test_dsr_map,
+                train_eval=train_eval,
+                test_eval=test_eval,
+                train_dsr_map=train_dsr_map,
+                test_dsr_map=test_dsr_map,
                 nn_state=nn_state,
                 config=config,
             )
 
         else:
-            raise ValueError(f"Unsupported method: {config.method}")
+            raise ValueError(f"Unknown method: {config.method}")
 
-        y = test_eval["duration_sec"].to_numpy(dtype=float)
-        y_all.extend(y.tolist())
-        p_all.extend(pred.astype(float).tolist())
+        y_true = test_eval["duration_sec"].to_numpy(dtype=float)
+        y_all.extend(y_true.tolist())
+        p_all.extend(pred.tolist())
 
-        if config.save_evaluation_file:
-            tmp = test_eval[["event_id", "rating", "first_review", "duration_sec"]].copy()
-            tmp["prediction_sec"] = pred.astype(float)
-            tmp["split"] = split_idx
-            save_tmp.append(tmp)
+        tmp = test_eval[["event_id", "card_id", "rating", "first_review", "duration_sec"]].copy()
+        tmp["pred_sec"] = pred
+        tmp["split"] = split_idx
+        save_tmp.append(tmp)
 
     if len(y_all) == 0:
-        raise RuntimeError(f"{user_id} produced no test samples after filtering.")
+        raise Exception(f"{user_id} does not have enough post-split usable data.")
 
-    if config.save_evaluation_file and len(save_tmp) > 0:
+    if len(save_tmp) > 0:
         save_evaluation_file(user_id, pd.concat(save_tmp, ignore_index=True), config)
 
-    return evaluate(
-        y_true=y_all,
-        y_pred=p_all,
-        user_id=user_id,
-        config=config,
-        algorithm_weights_last_split=last_algorithm_weights,
-    )
+    return evaluate(y_all, p_all, user_id, config, last_algorithm_weights)
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Benchmark review-time prediction methods on Anki revlogs.")
-    p.add_argument(
-        "--method",
-        type=str,
-        default="const",
-        choices=list(METHOD_NAMES.keys()),
-    )
-    p.add_argument("--data", type=str, default="../anki-revlogs-10k")
-    p.add_argument("--max-user-id", type=int, default=None)
+    parser = argparse.ArgumentParser(description="Benchmark review-time prediction methods on Anki revlogs.")
+    parser.add_argument("--data", type=str, default="../anki-revlogs-10k")
+    parser.add_argument("--max-user-id", type=int, default=None)
+    parser.add_argument("--method", type=str, default="const", choices=list(METHOD_NAMES.keys()))
+    parser.add_argument("--device", type=str, default=None)
 
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--n-splits", type=int, default=5)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--default-params", action="store_true")
+    parser.add_argument("--recency-weighting", action="store_true")
+    parser.add_argument("--partitions", type=str, default="none", choices=["none", "deck", "preset"])
 
-    p.add_argument("--default-params", action="store_true")
-    p.add_argument("--recency-weighting", action="store_true")
+    parser.add_argument("--save-evaluation-file", action="store_true")
+    parser.add_argument("--save-raw-output", action="store_true")
+    parser.add_argument("--save-weights", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
 
-    p.add_argument("--partitions", type=str, default="none", choices=["none", "deck", "preset"])
-    p.add_argument("--no-test-same-day", action="store_true")
-    p.add_argument("--no-train-same-day", action="store_true")
-    p.add_argument("--train-equals-test", action="store_true")
-    p.add_argument("--verbose", action="store_true")
+    parser.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--train-equals-test", action="store_true")
+    parser.add_argument("--no-test-same-day", action="store_true")
+    parser.add_argument("--no-train-same-day", action="store_true")
 
-    p.add_argument("--save-evaluation-file", action="store_true")
-    p.add_argument("--save-raw-output", action="store_true")
-    p.add_argument("--save-weights", action="store_true")
+    parser.add_argument("--include-first-review-in-eval", action="store_true", default=False)
 
-    # NEW flag
-    p.add_argument(
-        "--include-first-review-in-eval",
-        action="store_true",
-        help="Include first reviews in evaluation. Default is False (exclude first reviews).",
-        default=False
-    )
+    parser.add_argument("--nn-ckpt", type=str, default="checkpoints/review_time_pretrained.pth")
+    parser.add_argument("--nn-pretrain-users", type=int, default=250)
+    parser.add_argument("--nn-pretrain-epochs", type=int, default=8)
+    parser.add_argument("--nn-pretrain-lr", type=float, default=1e-3)
+    parser.add_argument("--nn-pretrain-batch-size", type=int, default=2048)
+    parser.add_argument("--nn-pretrain-max-samples-per-user", type=int, default=2000)
+    parser.add_argument("--nn-finetune-epochs", type=int, default=40)
+    parser.add_argument("--nn-finetune-lr", type=float, default=3e-3)
+    parser.add_argument("--nn-finetune-batch-size", type=int, default=512)
 
-    p.add_argument("--nn-ckpt", type=str, default="checkpoints/review_time_pretrained.pth")
-    p.add_argument("--nn-pretrain-users", type=int, default=250)
-    p.add_argument("--nn-pretrain-epochs", type=int, default=8)
-    p.add_argument("--nn-pretrain-lr", type=float, default=1e-3)
-    p.add_argument("--nn-pretrain-batch-size", type=int, default=2048)
-    p.add_argument("--nn-pretrain-max-samples-per-user", type=int, default=2000)
-    p.add_argument("--nn-finetune-epochs", type=int, default=40)
-    p.add_argument("--nn-finetune-lr", type=float, default=3e-3)
-    p.add_argument("--nn-finetune-batch-size", type=int, default=512)
-
-    return p
+    return parser
 
 
 def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+    args = _build_parser().parse_args()
     config = build_config(args)
 
     np.random.seed(config.seed)
@@ -1091,9 +1048,9 @@ def main() -> None:
 
     user_ids = _list_user_ids(config.data_path, config.max_user_id)
     if len(user_ids) == 0:
-        raise RuntimeError(f"No users found in: {config.data_path / 'revlogs'}")
+        raise RuntimeError("No user_id folders found under revlogs.")
 
-    nn_state: Optional[dict] = None
+    nn_state = None
     if config.method == "fsrs_dsr_grade_nn":
         nn_state = _load_or_pretrain_nn_state(config)
 
@@ -1107,61 +1064,74 @@ def main() -> None:
             if err is not None:
                 errors.append(err)
                 continue
-            if out is None:
-                continue
-            stats, raw = out
-            results.append(stats)
-            if raw is not None:
-                raws.append(raw)
-    else:
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=config.num_processes, mp_context=ctx) as ex:
-            futs = {ex.submit(process, uid, config, nn_state): uid for uid in user_ids}
-            for fut in tqdm(as_completed(futs), total=len(futs), desc="Users"):
-                out, err = fut.result()
-                if err is not None:
-                    errors.append(err)
-                    continue
-                if out is None:
-                    continue
+            if out is not None:
                 stats, raw = out
                 results.append(stats)
                 if raw is not None:
                     raws.append(raw)
+    else:
+        start_method = mp.get_start_method(allow_none=True)
+        if start_method is None:
+            try:
+                mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
 
-    stem = config.get_evaluation_file_name()
-    out_dir = Path(".")
-    stats_path = out_dir / f"{stem}.jsonl"
-    with stats_path.open("w", encoding="utf-8", newline="\n") as f:
-        for r in results:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    sort_jsonl(stats_path)
+        with ProcessPoolExecutor(max_workers=config.num_processes) as ex:
+            futures = {
+                ex.submit(process, uid, config, nn_state if config.method == "fsrs_dsr_grade_nn" else None): uid
+                for uid in user_ids
+            }
+            for f in tqdm(as_completed(futures), total=len(futures), desc="Users"):
+                out, err = f.result()
+                if err is not None:
+                    errors.append(err)
+                    continue
+                if out is not None:
+                    stats, raw = out
+                    results.append(stats)
+                    if raw is not None:
+                        raws.append(raw)
+
+    out_dir = Path("result")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = config.get_output_stem()
+    metrics_file = out_dir / f"{stem}.jsonl"
+    raw_file = out_dir / f"{stem}_raw.jsonl"
+    err_file = out_dir / f"{stem}_errors.log"
+
+    # FIX: always create/write metrics JSONL (even if empty), so file always exists.
+    write_jsonl(metrics_file, sorted(results, key=lambda x: x["user"]))
+    sort_jsonl(metrics_file)
 
     if config.save_raw_output:
-        raw_path = out_dir / f"{stem}_raw.jsonl"
-        with raw_path.open("w", encoding="utf-8", newline="\n") as f:
-            for r in raws:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        sort_jsonl(raw_path)
+        write_jsonl(raw_file, sorted(raws, key=lambda x: x["user"]))
+        sort_jsonl(raw_file)
 
-    if errors:
-        err_path = out_dir / f"{stem}_errors.log"
-        err_path.write_text("\n\n".join(errors), encoding="utf-8")
+    with err_file.open("w", encoding="utf-8", newline="\n") as f:
+        for e in errors:
+            f.write(e.rstrip() + "\n\n")
 
-    if len(results) == 0:
+    if len(results) > 0:
+        maes = [r["metrics"]["MAE"] for r in results]
+        rmses = [r["metrics"]["RMSE"] for r in results]
+        mapes = [r["metrics"]["MAPE"] for r in results if r["metrics"]["MAPE"] is not None]
+        summary = {
+            "users_ok": len(results),
+            "users_failed": len(errors),
+            "MAE_mean": float(np.mean(maes)),
+            "RMSE_mean": float(np.mean(rmses)),
+            "MAPE_mean": float(np.mean(mapes)) if len(mapes) > 0 else None,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
         print("No successful user evaluations.")
-        return
 
-    mae = np.mean([r["metrics"]["MAE"] for r in results])
-    rmse = np.mean([r["metrics"]["RMSE"] for r in results])
-    mapes = [r["metrics"]["MAPE"] for r in results if r["metrics"]["MAPE"] is not None]
-    mape = float(np.mean(mapes)) if len(mapes) > 0 else None
-
-    print(f"Saved: {stats_path}")
-    print(f"Users evaluated: {len(results)}/{len(user_ids)}")
-    print(f"MAE(mean over users): {mae:.6f}")
-    print(f"RMSE(mean over users): {rmse:.6f}")
-    print(f"MAPE(mean over users): {mape:.6f}" if mape is not None else "MAPE(mean over users): None")
+    print(f"metrics_jsonl={metrics_file}")
+    if config.save_raw_output:
+        print(f"raw_jsonl={raw_file}")
+    print(f"errors_log={err_file}")
 
 
 if __name__ == "__main__":
