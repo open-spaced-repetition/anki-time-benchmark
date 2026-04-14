@@ -12,7 +12,7 @@ DEFAULT_METHODS = [
     "CONST",
     "USER_MEDIAN",
     "GRADE_MEDIAN_4",
-    "GRADE_MEDIAN_8",
+    "GRADE_MEDIAN_8",  # same as GRADE_MEDIAN_4 if first reviews are excluded
     "FSRS7_R_LINEAR",
     "FSRS7_R_GRADE_INTERACT",
     "FSRS7_DSR_GRADE_NN",
@@ -69,6 +69,40 @@ def confidence_interval(values: np.ndarray, weights: np.ndarray) -> float:
 def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
     return float(np.average(values, weights=weights))
 
+
+def assert_user_size_consistency(
+    method_user_data: Dict[str, Dict[str, Dict]],
+    method_to_file: Dict[str, str],
+    suffix_label: str,
+) -> None:
+    """
+    For a single suffix, verify that if a user appears in multiple method files,
+    their `size` is identical across those files.
+    """
+    sizes_by_user: Dict[str, Dict[int, List[str]]] = {}
+
+    for method, user_map in method_user_data.items():
+        src = method_to_file.get(method, method)
+        for user, row in user_map.items():
+            size = int(row.get("size", 0))
+            sizes_by_user.setdefault(user, {}).setdefault(size, []).append(src)
+
+    mismatches = []
+    for user, size_groups in sizes_by_user.items():
+        if len(size_groups) > 1:
+            parts = []
+            for sz, files in sorted(size_groups.items(), key=lambda x: x[0]):
+                parts.append(f"size={sz}: {', '.join(sorted(files))}")
+            mismatches.append(f"user={user} -> " + " | ".join(parts))
+
+    if mismatches:
+        preview = "\n".join(mismatches[:20])
+        more = f"\n... and {len(mismatches) - 20} more" if len(mismatches) > 20 else ""
+        raise ValueError(
+            f"Inconsistent per-user `size` detected for suffix '{suffix_label}'.\n"
+            f"A user has different review counts across method files (possible bug).\n"
+            f"{preview}{more}"
+        )
 
 def discover_methods(result_dir: pathlib.Path, suffix: Optional[str]) -> List[str]:
     stems = [f.stem for f in sorted(result_dir.glob("*.jsonl"))]
@@ -163,6 +197,93 @@ def fmt_mean_ci(mean: Optional[float], ci: Optional[float], suffix: str = "") ->
     raise Exception("Unknown suffix")
 
 
+def print_table_for_suffix(
+    result_dir: pathlib.Path,
+    methods_arg: Optional[List[str]],
+    use_default_methods: bool,
+    suffix: str,
+    weight_by: str,
+) -> None:
+    suffix = suffix.strip()
+    suffix_for_match: Optional[str] = suffix or None
+
+    if methods_arg:
+        methods = methods_arg
+    elif use_default_methods:
+        methods = DEFAULT_METHODS
+    else:
+        methods = discover_methods(result_dir, suffix=suffix_for_match)
+
+    print(f"\n=== {suffix if suffix else '(no suffix)'} ===")
+
+    if not methods:
+        print("No result files found.")
+        return
+
+    method_user_data: Dict[str, Dict[str, Dict]] = {}
+    method_to_file: Dict[str, str] = {}
+
+    for method in methods:
+        fp = resolve_result_file(method, result_dir, suffix_for_match)
+        if fp is None:
+            continue
+
+        d = load_method_user_metrics(method, result_dir, suffix=suffix_for_match)
+        if d:
+            method_user_data[method] = d
+            method_to_file[method] = fp.name
+
+    if not method_user_data:
+        print("No valid method files with MAE/RMSE/MAPE found.")
+        return
+
+    assert_user_size_consistency(
+        method_user_data=method_user_data,
+        method_to_file=method_to_file,
+        suffix_label=suffix if suffix else "(no suffix)",
+    )
+
+    user_sets: List[Set[str]] = [set(d.keys()) for d in method_user_data.values()]
+    common_users = set.intersection(*user_sets) if user_sets else set()
+
+    if not common_users:
+        print("No common users found across selected method files.")
+        return
+
+    print(f"Aggregation weight: {weight_by} (99% CI, bootstrap BCa)")
+    print(f"Methods compared: {len(method_user_data)}")
+    print(f"Common users in all method files: {len(common_users)}")
+
+    ref_method = next(iter(method_user_data.keys()))
+    common_reviews = sum(method_user_data[ref_method][u]["size"] for u in common_users)
+    print(f"Common reviews (from shared users): {common_reviews}\n")
+
+    rows = []
+    for method, user_map in method_user_data.items():
+        metrics_list = [user_map[u] for u in common_users]
+
+        mae_mean, mae_ci = _metric_mean_ci(metrics_list, "MAE", weight_by)
+        rmse_mean, rmse_ci = _metric_mean_ci(metrics_list, "RMSE", weight_by)
+        mape_mean, mape_ci = _metric_mean_ci(metrics_list, "MAPE", weight_by)
+
+        rows.append(
+            (
+                method,
+                float("inf") if rmse_mean is None else rmse_mean,
+                fmt_mean_ci(rmse_mean, rmse_ci, "s"),
+                fmt_mean_ci(mae_mean, mae_ci, "s"),
+                fmt_mean_ci(mape_mean, mape_ci, "%"),
+            )
+        )
+
+    rows.sort(key=lambda x: x[1])
+
+    print("| Method | RMSE | MAE | MAPE |")
+    print("| --- | --- | --- | --- |")
+    for method, _, rmse, mae, mape in rows:
+        print(f"| {method} | {rmse} | {mae} | {mape} |")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-dir", default="./result", help="Directory with *.jsonl result files")
@@ -181,19 +302,20 @@ def main() -> None:
         help="Use built-in default method list instead of auto-discovery.",
     )
     parser.add_argument(
-        "--suffix",
-        default="NO_FIRST_REVIEWS",
-        help=(
-            "Result filename suffix used by benchmark outputs, e.g. "
-            "NO_FIRST_REVIEWS or WITH_FIRST_REVIEWS. "
-            "Set empty string to disable suffix matching."
-        ),
-    )
-    parser.add_argument(
         "--weight-by",
         choices=["reviews", "users"],
         default="reviews",
         help="Aggregate per-user metrics weighted by number of reviews or equally by users",
+    )
+    parser.add_argument(
+        "--without-first-suffix",
+        default="NO_FIRST_REVIEWS",
+        help="Filename suffix for runs excluding first reviews.",
+    )
+    parser.add_argument(
+        "--with-first-suffix",
+        default="WITH_FIRST_REVIEWS",
+        help="Filename suffix for runs including first reviews.",
     )
     args = parser.parse_args()
 
@@ -202,70 +324,20 @@ def main() -> None:
         print(f"Result directory not found: {result_dir}")
         return
 
-    suffix = args.suffix.strip() or None
-
-    if args.methods:
-        methods = args.methods
-    elif args.default_methods:
-        methods = DEFAULT_METHODS
-    else:
-        methods = discover_methods(result_dir, suffix=suffix)
-
-    if not methods:
-        print("No result files found.")
-        return
-
-    method_user_data: Dict[str, Dict[str, Dict]] = {}
-    for method in methods:
-        d = load_method_user_metrics(method, result_dir, suffix=suffix)
-        if d:
-            method_user_data[method] = d
-
-    if not method_user_data:
-        print("No valid method files with MAE/RMSE/MAPE found.")
-        return
-
-    user_sets: List[Set[str]] = [set(d.keys()) for d in method_user_data.values()]
-    common_users = set.intersection(*user_sets) if user_sets else set()
-
-    if not common_users:
-        print("No common users found across selected method files.")
-        return
-
-    suffix_label = suffix if suffix else "(none)"
-    print(f"Suffix: {suffix_label}")
-    print(f"Aggregation weight: {args.weight_by} (99% CI, bootstrap BCa)")
-    print(f"Methods compared: {len(method_user_data)}")
-    print(f"Common users in all method files: {len(common_users)}")
-
-    ref_method = next(iter(method_user_data.keys()))
-    common_reviews = sum(method_user_data[ref_method][u]["size"] for u in common_users)
-    print(f"Common reviews (from shared users): {common_reviews}\n")
-
-    rows = []
-    for method, user_map in method_user_data.items():
-        metrics_list = [user_map[u] for u in common_users]
-
-        mae_mean, mae_ci = _metric_mean_ci(metrics_list, "MAE", args.weight_by)
-        rmse_mean, rmse_ci = _metric_mean_ci(metrics_list, "RMSE", args.weight_by)
-        mape_mean, mape_ci = _metric_mean_ci(metrics_list, "MAPE", args.weight_by)
-
-        rows.append(
-            (
-                method,
-                float("inf") if rmse_mean is None else rmse_mean,
-                fmt_mean_ci(rmse_mean, rmse_ci, "s"),
-                fmt_mean_ci(mae_mean, mae_ci, "s"),
-                fmt_mean_ci(mape_mean, mape_ci, "%"),
-            )
-        )
-
-    rows.sort(key=lambda x: x[1])
-
-    print("| Method | RMSE | MAE | MAPE |")
-    print("| --- | --- | --- | --- |")
-    for method, _, rmse, mae, mape in rows:
-        print(f"| {method} | {rmse} | {mae} | {mape} |")
+    print_table_for_suffix(
+        result_dir=result_dir,
+        methods_arg=args.methods,
+        use_default_methods=args.default_methods,
+        suffix=args.without_first_suffix,
+        weight_by=args.weight_by,
+    )
+    print_table_for_suffix(
+        result_dir=result_dir,
+        methods_arg=args.methods,
+        use_default_methods=args.default_methods,
+        suffix=args.with_first_suffix,
+        weight_by=args.weight_by,
+    )
 
 
 if __name__ == "__main__":
