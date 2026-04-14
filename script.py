@@ -34,27 +34,26 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq  # type: ignore
 import torch
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 from torch import Tensor, nn
 from tqdm.auto import tqdm  # type: ignore
 
-from data import create_features
 from fsrs_optimizer import BatchDataset, BatchLoader, DevicePrefetchLoader  # type: ignore
 from fsrs_v7 import FSRS7
+from data import create_features
 from review_time_nn import (
-    Normalizer,
     ReviewTimeNN,
+    Normalizer,
     featurize_dsrg,
-    predict_seconds,
     train_regressor,
+    predict_seconds,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 METHOD_NAMES = {
@@ -99,9 +98,7 @@ class Config:
     train_equals_test: bool = False
     no_test_same_day: bool = False
     no_train_same_day: bool = False
-
-    # default False = first reviews excluded from evaluation
-    include_first_review_in_eval: bool = False
+    with_first_reviews: bool = False
 
     partitions: str = "none"
 
@@ -116,32 +113,15 @@ class Config:
     num_processes: int = 1
 
     def get_evaluation_file_name(self) -> str:
-        base = METHOD_NAMES[self.method]
-        first_tag = "INCL_FIRST_REVIEW_EVAL" if self.include_first_review_in_eval else "EXCL_FIRST_REVIEW_EVAL"
-        return f"{base}_{first_tag}"
-
-    def get_output_stem(self) -> str:
-        # Keep filenames consistent with first-review eval setting.
-        return self.get_evaluation_file_name()
+        suffix = "WITH_FIRST_REVIEWS" if self.with_first_reviews else "NO_FIRST_REVIEWS"
+        return f"{METHOD_NAMES[self.method]}_{suffix}"
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    project_root = Path(__file__).resolve().parent
-
-    data_path = Path(args.data)
-    if not data_path.is_absolute():
-        data_path = (project_root / data_path).resolve()
-
-    nn_ckpt_path = Path(args.nn_ckpt)
-    if not nn_ckpt_path.is_absolute():
-        nn_ckpt_path = (project_root / nn_ckpt_path).resolve()
-
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     return Config(
         data_path=Path(args.data),
         max_user_id=args.max_user_id,
         method=args.method,
-        device=device,
         batch_size=args.batch_size,
         n_splits=args.n_splits,
         seed=args.seed,
@@ -155,8 +135,7 @@ def build_config(args: argparse.Namespace) -> Config:
         num_processes=args.processes,
         no_test_same_day=args.no_test_same_day,
         no_train_same_day=args.no_train_same_day,
-        train_equals_test=args.train_equals_test,
-        include_first_review_in_eval=args.include_first_review_in_eval,
+        with_first_reviews=args.with_first_reviews,
         nn_ckpt_path=Path(args.nn_ckpt),
         nn_pretrain_users=args.nn_pretrain_users,
         nn_pretrain_epochs=args.nn_pretrain_epochs,
@@ -187,7 +166,7 @@ def _drop_frequency_jump_tail(
         return out
 
     j = int(jump_pos[-1])
-    tail_values = vc_sorted.index[(j + 1) :]
+    tail_values = vc_sorted.index[(j + 1):]
 
     if require_whole_seconds:
         tail_values = [v for v in tail_values if (int(v) % 1000 == 0)]
@@ -282,9 +261,6 @@ def load_user_frames(user_id: int, config: Config) -> tuple[pd.DataFrame, pd.Dat
     eval_df["partition"] = eval_df["partition"].fillna(-1).astype(int)
     eval_df = eval_df.sort_values("event_id").copy()
 
-    if not config.include_first_review_in_eval:
-        eval_df = eval_df[~eval_df["first_review"]].copy()
-
     if len(eval_df) < 6:
         raise Exception(f"{user_id} does not have enough usable (non-censored) data.")
 
@@ -375,7 +351,7 @@ class AlgorithmTrainer:
                 if torch.max(seq_lens).item() <= 0:
                     continue
                 result = self._batch_process(batch)
-                total_loss += (self.loss_fn(result["retentions"], result["labels"]) * result["weights"]).sum().item()
+                total_loss += ((self.loss_fn(result["retentions"], result["labels"]) * result["weights"]).sum().item())
                 if "penalty" in result:
                     total_loss += (result["penalty"] / epoch_len).item()
                 total_items += batch[3].shape[0]
@@ -384,9 +360,7 @@ class AlgorithmTrainer:
         return total_loss / max(total_items, 1), self.algorithm.state_dict()
 
 
-def batch_predict_dsr(
-    algorithm: FSRS7, dataset: pd.DataFrame, config: Config
-) -> tuple[list[float], list[float], list[float]]:
+def batch_predict_dsr(algorithm: FSRS7, dataset: pd.DataFrame, config: Config) -> tuple[list[float], list[float], list[float]]:
     if dataset is None or len(dataset) == 0:
         return [], [], []
 
@@ -467,6 +441,7 @@ def _predict_grade_median_8(train_df: pd.DataFrame, test_df: pd.DataFrame) -> np
         g = int(row["rating"])
         pred.append(first_map[g] if bool(row["first_review"]) else non_first_map[g])
     return np.array(pred, dtype=float)
+
 
 def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
@@ -675,21 +650,23 @@ def _build_pretrain_nn_state(config: Config) -> dict:
             if len(algorithm_df) == 0:
                 continue
 
+            # Fit FSRS per user (and per partition, if enabled) on full user history
             weights = _fit_algorithm_partition_weights(algorithm_df, config)
 
+            # Predict DSR using fitted FSRS weights
             dsr_map: dict[int, tuple[float, float, float]] = {}
             for partition, w in weights.items():
                 part_df = algorithm_df[algorithm_df["partition"] == partition].copy()
                 if len(part_df) == 0:
                     continue
 
-                    # noqa: E701
                 algo = FSRS7(config, w=w).to(config.device)
                 d, s, r = batch_predict_dsr(algo, part_df, config)
 
                 for eid, dd, ss, rr in zip(part_df["event_id"].tolist(), d, s, r):
                     dsr_map[int(eid)] = (float(dd), float(ss), float(rr))
 
+            # Build NN samples from non-first reviews only
             rows = eval_df[~eval_df["first_review"]].copy()
             rows["dsr"] = rows["event_id"].map(dsr_map)
             rows = rows.dropna(subset=["dsr"])
@@ -858,7 +835,7 @@ def evaluate(
         "size": int(len(y_true)),
     }
 
-    if algorithm_weights_last_split and config.save_weights:
+    if algorithm_weights_last_split:
         stats["algorithm_parameters"] = {
             int(partition): list(map(lambda x: round(float(x), 6), w))
             for partition, w in algorithm_weights_last_split.items()
@@ -878,30 +855,16 @@ def evaluate(
 
 def save_evaluation_file(user_id: int, df: pd.DataFrame, config: Config) -> None:
     if config.save_evaluation_file:
-        out_dir = Path("evaluation") / config.get_evaluation_file_name()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out_dir / f"{user_id}.tsv", sep="\t", index=False)
+        df.to_csv(f"evaluation/{config.get_evaluation_file_name()}/{user_id}.tsv", sep="\t", index=False)
 
 
 def sort_jsonl(file: Path) -> list:
-    if not file.exists():
-        file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text("", encoding="utf-8")
-        return []
-
-    data = [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    data = [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines()]
     data.sort(key=lambda x: x["user"])
     with file.open("w", encoding="utf-8", newline="\n") as f:
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
     return data
-
-
-def write_jsonl(file: Path, items: list[dict]) -> None:
-    file.parent.mkdir(parents=True, exist_ok=True)
-    with file.open("w", encoding="utf-8", newline="\n") as f:
-        for item in items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def _catch(func):
@@ -929,7 +892,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
     save_tmp: list[pd.DataFrame] = []
     last_algorithm_weights: Optional[dict[int, list]] = None
 
-    for split_idx, (train_idx, test_idx) in enumerate(tscv.split(eval_df)):
+    for _, (train_idx, test_idx) in enumerate(tscv.split(eval_df)):
         if not config.train_equals_test:
             train_eval = eval_df.iloc[train_idx].copy()
             test_eval = eval_df.iloc[test_idx].copy()
@@ -966,21 +929,17 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         elif config.method == "grade_median_8":
             pred = _predict_grade_median_8(train_eval, test_eval)
 
-        elif config.method == "fsrs_r_linear":
-            train_R_map, test_R_map, last_algorithm_weights = _predict_R_maps(
-                train_algorithm_df, test_algorithm_df, config
-            )
-            pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
-
-        elif config.method == "fsrs_r_grade_interact":
-            train_R_map, test_R_map, last_algorithm_weights = _predict_R_maps(
-                train_algorithm_df, test_algorithm_df, config
-            )
-            pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
+        elif config.method in ("fsrs_r_linear", "fsrs_r_grade_interact"):
+            train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
+            last_algorithm_weights = weights if weights else last_algorithm_weights
+            if config.method == "fsrs_r_linear":
+                pred = _predict_fsrs_r_linear(train_eval, test_eval, train_R_map, test_R_map)
+            else:
+                pred = _predict_fsrs_r_grade_interact(train_eval, test_eval, train_R_map, test_R_map)
 
         elif config.method == "fsrs_dsr_grade_nn":
             if nn_state is None:
-                raise RuntimeError("nn_state is required for fsrs_dsr_grade_nn")
+                raise RuntimeError("NN state is required for fsrs_dsr_grade_nn but is None.")
             train_dsr_map, test_dsr_map = _predict_DSR_maps(train_algorithm_df, test_algorithm_df, config)
             pred = _predict_fsrs_dsr_grade_nn(
                 train_eval=train_eval,
@@ -994,159 +953,141 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
-        y_true = test_eval["duration_sec"].to_numpy(dtype=float)
-        y_all.extend(y_true.tolist())
-        p_all.extend(pred.tolist())
+        pred = np.maximum(pred.astype(float), 0.0)
+        out_df = test_eval.copy()
+        out_df["t_true"] = out_df["duration_sec"].astype(float)
+        out_df["t_pred"] = pred.astype(float)
+        out_df["used_for_metrics"] = True if config.with_first_reviews else ~out_df["first_review"]
 
-        tmp = test_eval[["event_id", "card_id", "rating", "first_review", "duration_sec"]].copy()
-        tmp["pred_sec"] = pred
-        tmp["split"] = split_idx
-        save_tmp.append(tmp)
+        metric_df = out_df if config.with_first_reviews else out_df[~out_df["first_review"]].copy()
+        if len(metric_df) > 0:
+            y_all.extend(metric_df["t_true"].tolist())
+            p_all.extend(metric_df["t_pred"].tolist())
+
+        save_tmp.append(out_df)
+
+        if config.train_equals_test:
+            break
+
+    if len(save_tmp) == 0:
+        raise Exception(f"{user_id}: no valid splits after filtering.")
 
     if len(y_all) == 0:
-        raise Exception(f"{user_id} does not have enough post-split usable data.")
+        raise Exception(f"{user_id}: no evaluation rows after filtering by with_first_reviews={config.with_first_reviews}.")
 
-    if len(save_tmp) > 0:
-        save_evaluation_file(user_id, pd.concat(save_tmp, ignore_index=True), config)
-
+    save_df = pd.concat(save_tmp, ignore_index=True)
+    save_evaluation_file(user_id, save_df, config)
     return evaluate(y_all, p_all, user_id, config, last_algorithm_weights)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Benchmark review-time prediction methods on Anki revlogs.")
-    parser.add_argument("--data", type=str, default="../anki-revlogs-10k")
-    parser.add_argument("--max-user-id", type=int, default=None)
-    parser.add_argument("--method", type=str, default="const", choices=list(METHOD_NAMES.keys()))
-    parser.add_argument("--device", type=str, default=None)
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Review-time benchmark")
+    p.add_argument("--data", default="../anki-revlogs-10k")
+    p.add_argument("--processes", type=int, default=1)
 
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--n-splits", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--default-params", action="store_true")
-    parser.add_argument("--recency-weighting", action="store_true")
-    parser.add_argument("--partitions", type=str, default="none", choices=["none", "deck", "preset"])
+    p.add_argument(
+        "--method",
+        default="const",
+        choices=[
+            "const",
+            "user_median",
+            "grade_median_4",
+            "grade_median_8",
+            "fsrs_r_linear",
+            "fsrs_r_grade_interact",
+            "fsrs_dsr_grade_nn",
+        ],
+    )
 
-    parser.add_argument("--save-evaluation-file", action="store_true")
-    parser.add_argument("--save-raw-output", action="store_true")
-    parser.add_argument("--save-weights", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=512)
+    p.add_argument("--n-splits", dest="n_splits", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--default-params", dest="default_params", action="store_true")
+    p.add_argument("--recency-weighting", dest="recency_weighting", action="store_true")
+    p.add_argument("--partitions", default="none", choices=["none", "preset", "deck"])
+    p.add_argument("--no-test-same-day", dest="no_test_same_day", action="store_true")
+    p.add_argument("--no-train-same-day", dest="no_train_same_day", action="store_true")
+    p.add_argument("--with_first_reviews", action="store_true")
+    p.add_argument("--save-evaluation-file", dest="save_evaluation_file", action="store_true")
+    p.add_argument("--save-raw", dest="save_raw_output", action="store_true")
+    p.add_argument("--save-weights", dest="save_weights", action="store_true")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--max-user-id", dest="max_user_id", type=int, default=None)
 
-    parser.add_argument("--processes", type=int, default=1)
-    parser.add_argument("--train-equals-test", action="store_true")
-    parser.add_argument("--no-test-same-day", action="store_true")
-    parser.add_argument("--no-train-same-day", action="store_true")
+    p.add_argument("--nn_ckpt", type=str, default="checkpoints/review_time_pretrained.pth")
+    p.add_argument("--nn_pretrain_users", type=int, default=250)
+    p.add_argument("--nn_pretrain_epochs", type=int, default=8)
+    p.add_argument("--nn_pretrain_lr", type=float, default=1e-3)
+    p.add_argument("--nn_pretrain_batch_size", type=int, default=2048)
+    p.add_argument("--nn_pretrain_max_samples_per_user", type=int, default=2000)
+    p.add_argument("--nn_finetune_epochs", type=int, default=40)
+    p.add_argument("--nn_finetune_lr", type=float, default=3e-3)
+    p.add_argument("--nn_finetune_batch_size", type=int, default=512)
 
-    parser.add_argument("--include-first-review-in-eval", action="store_true", default=False)
-
-    parser.add_argument("--nn-ckpt", type=str, default="checkpoints/review_time_pretrained.pth")
-    parser.add_argument("--nn-pretrain-users", type=int, default=250)
-    parser.add_argument("--nn-pretrain-epochs", type=int, default=8)
-    parser.add_argument("--nn-pretrain-lr", type=float, default=1e-3)
-    parser.add_argument("--nn-pretrain-batch-size", type=int, default=2048)
-    parser.add_argument("--nn-pretrain-max-samples-per-user", type=int, default=2000)
-    parser.add_argument("--nn-finetune-epochs", type=int, default=40)
-    parser.add_argument("--nn-finetune-lr", type=float, default=3e-3)
-    parser.add_argument("--nn-finetune-batch-size", type=int, default=512)
-
-    return parser
+    return p.parse_args()
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    mp.set_start_method("spawn", force=True)
+    args = _parse_args()
     config = build_config(args)
-
-    np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
-    user_ids = _list_user_ids(config.data_path, config.max_user_id)
-    if len(user_ids) == 0:
-        raise RuntimeError("No user_id folders found under revlogs.")
+    dataset = pq.ParquetDataset(config.data_path / "revlogs")
+    file_name = config.get_evaluation_file_name()
 
-    nn_state = None
-    if config.method == "fsrs_dsr_grade_nn":
-        nn_state = _load_or_pretrain_nn_state(config)
+    Path(f"evaluation/{file_name}").mkdir(parents=True, exist_ok=True)
+    Path("result").mkdir(parents=True, exist_ok=True)
+    Path("raw").mkdir(parents=True, exist_ok=True)
 
-    results: list[dict] = []
-    raws: list[dict] = []
-    errors: list[str] = []
+    result_file = Path(f"result/{file_name}.jsonl")
+    raw_file = Path(f"raw/{file_name}.jsonl")
 
-    if config.num_processes <= 1:
-        for uid in tqdm(user_ids, desc="Users"):
-            out, err = process(uid, config, nn_state)
-            if err is not None:
-                errors.append(err)
-                continue
-            if out is not None:
-                stats, raw = out
-                results.append(stats)
-                if raw is not None:
-                    raws.append(raw)
-    else:
-        start_method = mp.get_start_method(allow_none=True)
-        if start_method is None:
-            try:
-                mp.set_start_method("spawn", force=True)
-            except RuntimeError:
-                pass
-
-        with ProcessPoolExecutor(max_workers=config.num_processes) as ex:
-            futures = {
-                ex.submit(process, uid, config, nn_state if config.method == "fsrs_dsr_grade_nn" else None): uid
-                for uid in user_ids
-            }
-            for f in tqdm(as_completed(futures), total=len(futures), desc="Users"):
-                out, err = f.result()
-                if err is not None:
-                    errors.append(err)
-                    continue
-                if out is not None:
-                    stats, raw = out
-                    results.append(stats)
-                    if raw is not None:
-                        raws.append(raw)
-
-    out_dir = PROJECT_ROOT / "result"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    stem = config.get_output_stem()
-    metrics_file = out_dir / f"{stem}.jsonl"
-    raw_file = out_dir / f"{stem}_raw.jsonl"
-    err_file = out_dir / f"{stem}_errors.log"
-
-    # FIX: always create/write metrics JSONL (even if empty), so file always exists.
-    write_jsonl(metrics_file, sorted(results, key=lambda x: x["user"]))
-    sort_jsonl(metrics_file)
-
-    if config.save_raw_output:
-        write_jsonl(raw_file, sorted(raws, key=lambda x: x["user"]))
+    processed_users: set[int] = set()
+    if result_file.exists():
+        processed_users = {d["user"] for d in sort_jsonl(result_file)}
+    if config.save_raw_output and raw_file.exists():
         sort_jsonl(raw_file)
 
-    with err_file.open("w", encoding="utf-8", newline="\n") as f:
-        for e in errors:
-            f.write(e.rstrip() + "\n\n")
+    unprocessed = []
+    for user_id in dataset.partitioning.dictionaries[0]:
+        uid = user_id.as_py()
+        if config.max_user_id is not None and uid > config.max_user_id:
+            continue
+        if uid not in processed_users:
+            unprocessed.append(uid)
+    unprocessed.sort()
 
-    if len(results) > 0:
-        maes = [r["metrics"]["MAE"] for r in results]
-        rmses = [r["metrics"]["RMSE"] for r in results]
-        mapes = [r["metrics"]["MAPE"] for r in results if r["metrics"]["MAPE"] is not None]
-        summary = {
-            "users_ok": len(results),
-            "users_failed": len(errors),
-            "MAE_mean": float(np.mean(maes)),
-            "RMSE_mean": float(np.mean(rmses)),
-            "MAPE_mean": float(np.mean(mapes)) if len(mapes) > 0 else None,
-        }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-    else:
-        print("No successful user evaluations.")
+    global_nn_state: Optional[dict] = None
+    if config.method == "fsrs_dsr_grade_nn":
+        global_nn_state = _load_or_pretrain_nn_state(config)
 
-    print(f"metrics_jsonl={metrics_file}")
-    if config.save_raw_output:
-        print(f"raw_jsonl={raw_file}")
-    print(f"errors_log={err_file}")
+    with ProcessPoolExecutor(max_workers=config.num_processes) as executor:
+        futures = [executor.submit(process, uid, config, global_nn_state) for uid in unprocessed]
+        pbar = tqdm(as_completed(futures), total=len(futures), smoothing=0.03)
 
-    print(f"cwd={Path.cwd()}")
-    print(f"metrics_jsonl_abs={metrics_file.resolve()}")
+        for future in pbar:
+            try:
+                result, error = future.result()
+                if error:
+                    tqdm.write(str(error))
+                    continue
+
+                stats, raw = result
+                with open(result_file, "a", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps(stats, ensure_ascii=False) + "\n")
+
+                if raw:
+                    with open(raw_file, "a", encoding="utf-8", newline="\n") as f:
+                        f.write(json.dumps(raw, ensure_ascii=False) + "\n")
+
+                pbar.set_description(f"Processed user {stats['user']}")
+            except Exception as e:
+                tqdm.write(str(e))
+
+    sort_jsonl(result_file)
+    if config.save_raw_output and raw_file.exists():
+        sort_jsonl(raw_file)
 
 
 if __name__ == "__main__":
