@@ -12,6 +12,8 @@ DEFAULT_METHODS = [
     "CONST",
     "USER_MEDIAN",
     "GRADE_MEDIAN_4",
+    "GRADE_MEDIAN_4_4",
+    "POOR_MANS_FSRS"
     "GRADE_MEDIAN_8",  # same as GRADE_MEDIAN_4 if first reviews are excluded
     "FSRS7_R_LINEAR",
     "FSRS7_R_GRADE_INTERACT",
