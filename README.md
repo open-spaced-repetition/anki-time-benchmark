@@ -29,7 +29,93 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 6) moving_avg: [similar to the one used in the main benchmark](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/model_processors.py#L119-L157), it predicts time of the next review based on time of recent reviews. Interval lengths and grades don't matter. Roughly speaking, the idea is that if recent reviews took around 10 seconds, then the next review will probably also take around 10 seconds, and if recent reviews took 5 seconds, then the next review will probably also take around 5 seconds.
 7) fsrs_r_linear: `t=b + a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
 8) fsrs_r_grade_interact: `t=a0 + a1*G + a2*R + a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
-9) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
+9) fsrs_one_minus_r_s_reps_d_linear: `t = a + b * (1 - R) + c * S + d * reps + e * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
+10) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
+
+### Running
+
+Run one method:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --method grade_median_4 --processes 1
+```
+
+Run with saved fitted parameters in `result/*.jsonl`:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --method fsrs_r_linear --save-weights
+```
+
+For `fsrs_r_linear`, result rows also include `r_bucket_precision` with 5% `R` buckets and `% precise enough` (`|pred-true| <= 2.0s`).
+
+Run all methods in one command:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --all-methods --processes 1
+```
+
+FSRS optimization cache (enabled by default):
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --all-methods --fsrs-weights-cache-dir .cache/fsrs_weights
+```
+
+Disable FSRS cache:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --all-methods --no-cache-fsrs-weights
+```
+
+Run only one exact user:
+
+```bash
+python3 script.py --data ../anki-revlogs-10k --user-id 100001 --method grade_median_4 --processes 1
+```
+
+### Script CLI options
+
+Main run selection:
+
+- `--data <path>`: dataset root (expects `<path>/revlogs/user_id=...` partitions)
+- `--method <name>`: run one method
+- `--all-methods`: run all methods in one invocation
+- `--user-id <id>`: run only one exact user id
+- `--max-user-id <id>`: run users with `user_id <= id`
+- `--processes <n>`: number of worker processes
+- `--with_first_reviews`: include first reviews in metrics (default excludes)
+
+Newly added method names:
+
+- `fsrs_one_minus_r_s_reps_d_linear`
+
+Outputs / saved metadata:
+
+- `--save-evaluation-file`: writes per-user TSV files under `evaluation/`
+- `--save-raw`: writes raw `t_pred` and `t_true` under `raw/`
+- `--save-weights`: stores fitted parameters in `result/*.jsonl`
+- For `fsrs_r_linear`, `result/*.jsonl` includes:
+- `regression_parameters` (`a`, `b`)
+- `r_bucket_precision` (5% R buckets, with `% precise enough` where `|pred-true| <= 2.0s`)
+- For `fsrs_one_minus_r_s_reps_d_linear`, `result/*.jsonl` includes:
+- `regression_parameters` (`a`, `b`, `c`, `d`, `e`)
+
+FSRS optimization cache:
+
+- `--fsrs-weights-cache-dir <path>`: cache directory for fitted FSRS weights
+- `--no-cache-fsrs-weights`: disable cache reads/writes
+- Default behavior: FSRS weight cache is enabled
+
+NN options (`fsrs_dsr_grade_nn`):
+
+- `--nn_ckpt <path>`
+- `--nn_pretrain_users <n>`
+- `--nn_pretrain_epochs <n>`
+- `--nn_pretrain_lr <float>`
+- `--nn_pretrain_batch_size <n>`
+- `--nn_pretrain_max_samples_per_user <n>`
+- `--nn_finetune_epochs <n>`
+- `--nn_finetune_lr <float>`
+- `--nn_finetune_batch_size <n>`
 
 
 ## Result

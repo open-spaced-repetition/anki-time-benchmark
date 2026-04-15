@@ -22,6 +22,9 @@ DEFAULT_METHODS = [
 
 
 def sigdig(value: float, CI: float) -> Tuple[str, str]:
+    if not np.isfinite(CI) or CI <= 0:
+        return str(f"{round(value, 2):.2f}"), "0.00"
+
     def num_lead_zeros(x: float) -> float:
         return math.inf if x == 0 else -math.floor(math.log10(abs(x))) - 1
 
@@ -199,6 +202,60 @@ def fmt_mean_ci(mean: Optional[float], ci: Optional[float], suffix: str = "") ->
     raise Exception("Unknown suffix")
 
 
+def _print_aligned_markdown_table(headers: List[str], rows: List[List[str]]) -> None:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _fmt_row(cells: List[str]) -> str:
+        padded = [cells[i].ljust(widths[i]) for i in range(len(cells))]
+        return "| " + " | ".join(padded) + " |"
+
+    print(_fmt_row(headers))
+    print("| " + " | ".join("-" * widths[i] for i in range(len(widths))) + " |")
+    for row in rows:
+        print(_fmt_row(row))
+
+
+def _format_highlights(
+    rows: List[Tuple[str, float, Optional[float], Optional[float], str, str, str]]
+) -> List[str]:
+    valid_rmse = [r for r in rows if r[1] != float("inf")]
+    valid_mae = [r for r in rows if r[2] is not None]
+    valid_mape = [r for r in rows if r[3] is not None]
+
+    def _best(rows_in: List[Tuple], metric_idx: int) -> Tuple[List[str], float]:
+        best_v = min(float(r[metric_idx]) for r in rows_in)
+        winners = [str(r[0]) for r in rows_in if np.isclose(float(r[metric_idx]), best_v)]
+        return winners, best_v
+
+    rmse_winners, rmse_best = _best(valid_rmse, 1)
+    mae_winners, mae_best = _best(valid_mae, 2)
+    mape_winners, mape_best = _best(valid_mape, 3)
+
+    lines = [
+        f"- Best RMSE: {', '.join(rmse_winners)} ({rmse_best:.4f} s)",
+        f"- Best MAE: {', '.join(mae_winners)} ({mae_best:.4f} s)",
+        f"- Best MAPE: {', '.join(mape_winners)} ({mape_best:.4f}%)",
+    ]
+
+    common = set(rmse_winners) & set(mae_winners) & set(mape_winners)
+    if common:
+        lines.append(f"- Overall: {', '.join(sorted(common))} is best on RMSE, MAE, and MAPE.")
+    else:
+        lines.append("- Overall: no single method is best on all three metrics.")
+    return lines
+
+
+def _metric_interpretation_line() -> str:
+    return (
+        "Interpretation tip: 10s MAE means ~10s average absolute error; "
+        "10s RMSE is in seconds too but penalizes large misses more; "
+        "MAPE is percentage (e.g., 10% means ~2s error when true time is 20s)."
+    )
+
+
 def print_table_for_suffix(
     result_dir: pathlib.Path,
     methods_arg: Optional[List[str]],
@@ -272,6 +329,8 @@ def print_table_for_suffix(
             (
                 method,
                 float("inf") if rmse_mean is None else rmse_mean,
+                mae_mean,
+                mape_mean,
                 fmt_mean_ci(rmse_mean, rmse_ci, "s"),
                 fmt_mean_ci(mae_mean, mae_ci, "s"),
                 fmt_mean_ci(mape_mean, mape_ci, "%"),
@@ -280,10 +339,12 @@ def print_table_for_suffix(
 
     rows.sort(key=lambda x: x[1])
 
-    print("| Method | RMSE | MAE | MAPE |")
-    print("| --- | --- | --- | --- |")
-    for method, _, rmse, mae, mape in rows:
-        print(f"| {method} | {rmse} | {mae} | {mape} |")
+    table_rows = [[method, rmse, mae, mape] for method, _, _, _, rmse, mae, mape in rows]
+    _print_aligned_markdown_table(["Method", "RMSE", "MAE", "MAPE"], table_rows)
+    print("\nHighlights:")
+    for line in _format_highlights(rows):
+        print(line)
+    print(_metric_interpretation_line())
 
 
 def main() -> None:
