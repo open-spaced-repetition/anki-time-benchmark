@@ -28,9 +28,13 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 5) poor_mans_fsrs: `t=a0 + a1*ln(number of Agains) + a2*ln(total number of all reps) + a3*e^(-a4*interval length) + a5*G`. This is akin to using a very crude version of FSRS.
 6) moving_avg: [similar to the one used in the main benchmark](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/model_processors.py#L119-L157), it predicts time of the next review based on time of recent reviews. Interval lengths and grades don't matter. Roughly speaking, the idea is that if recent reviews took around 10 seconds, then the next review will probably also take around 10 seconds, and if recent reviews took 5 seconds, then the next review will probably also take around 5 seconds.
 7) fsrs_r_linear: `t=b + a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
-8) fsrs_r_grade_interact: `t=a0 + a1*G + a2*R + a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
-9) fsrs_one_minus_r_s_reps_d_linear: `t = a + b * (1 - R) + c * S + d * reps + e * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
-10) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
+8) fsrs_r_ridge: `t=b + a*R` with Ridge regularization.
+9) fsrs_r_linear_by_grades: `t=b_g + a_g*R`, one linear regression per grade (`g in {Again, Hard, Good, Easy}`).
+10) fsrs_r_grade_interact: `t=a0 + a1*G + a2*R + a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
+11) fsrs_one_minus_r_s_reps_d_linear: `t = a + b * (1 - R) + c * S + d * reps + e * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
+12) fsrs_one_minus_r_s_reps_d_linear_by_grade: same as above, but fitted separately per grade.
+13) fsrs_one_minus_r_s_reps_d_ridge: same features as above, with Ridge regularization.
+14) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
 
 ### Running
 
@@ -46,7 +50,9 @@ Run with saved fitted parameters in `result/*.jsonl`:
 python3 script.py --data ../anki-revlogs-10k --method fsrs_r_linear --save-weights
 ```
 
-For `fsrs_r_linear`, result rows also include `r_bucket_precision` with 5% `R` buckets and `% precise enough` (`|pred-true| <= 2.0s`).
+Result rows include `r_bucket_precision` (all methods) with 5% `R` buckets, including mean true time, mean predicted time, RMSE, MAE, and `% precise enough` (`|pred-true| <= 2.0s`). `evaluate.py` also reports a ratio-mapping score vs the `0.85-0.90` bucket.
+
+`evaluate.py` additionally prints a per-method correlation summary between `R` and response time (bucket-level weighted Pearson and Spearman for true/predicted means).
 
 Run all methods in one command:
 
@@ -87,23 +93,37 @@ Main run selection:
 Newly added method names:
 
 - `fsrs_one_minus_r_s_reps_d_linear`
+- `fsrs_r_ridge`
+- `fsrs_r_linear_by_grades`
+- `fsrs_one_minus_r_s_reps_d_ridge`
+- `fsrs_one_minus_r_s_reps_d_linear_by_grade`
 
 Outputs / saved metadata:
 
 - `--save-evaluation-file`: writes per-user TSV files under `evaluation/`
 - `--save-raw`: writes raw `t_pred` and `t_true` under `raw/`
 - `--save-weights`: stores fitted parameters in `result/*.jsonl`
+- `r_bucket_precision` is included for all methods (5% `R` buckets)
 - For `fsrs_r_linear`, `result/*.jsonl` includes:
 - `regression_parameters` (`a`, `b`)
+- For `fsrs_r_linear_by_grades`, `regression_parameters` includes per-grade coefficients
+- (`again_a`, `again_b`, `hard_a`, `hard_b`, `good_a`, `good_b`, `easy_a`, `easy_b`)
 - `r_bucket_precision` (5% R buckets, with `% precise enough` where `|pred-true| <= 2.0s`)
 - For `fsrs_one_minus_r_s_reps_d_linear`, `result/*.jsonl` includes:
 - `regression_parameters` (`a`, `b`, `c`, `d`, `e`)
+- For `fsrs_one_minus_r_s_reps_d_linear_by_grade`, `regression_parameters` includes per-grade
+- (`*_a`, `*_b`, `*_c`, `*_d`, `*_e`)
+- For ridge variants, `regression_parameters` also include `ridge_alpha`
 
 FSRS optimization cache:
 
 - `--fsrs-weights-cache-dir <path>`: cache directory for fitted FSRS weights
 - `--no-cache-fsrs-weights`: disable cache reads/writes
 - Default behavior: FSRS weight cache is enabled
+
+Ridge option:
+
+- `--ridge-alpha <float>`: regularization strength for Ridge methods (`fsrs_r_ridge`, `fsrs_one_minus_r_s_reps_d_ridge`)
 
 NN options (`fsrs_dsr_grade_nn`):
 
@@ -116,6 +136,10 @@ NN options (`fsrs_dsr_grade_nn`):
 - `--nn_finetune_epochs <n>`
 - `--nn_finetune_lr <float>`
 - `--nn_finetune_batch_size <n>`
+
+Checkpoint note:
+
+- Existing `checkpoints/review_time_pretrained.pth` files are loaded with full checkpoint deserialization (needed for stored normalizer arrays).
 
 
 ## Result

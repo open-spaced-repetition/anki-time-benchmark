@@ -167,6 +167,208 @@ def load_method_user_metrics(
     return out
 
 
+def load_method_r_bucket_precision(
+    method: str, result_dir: pathlib.Path, suffix: Optional[str]
+) -> Dict[str, List[Dict]]:
+    fp = resolve_result_file(method, result_dir, suffix)
+    if fp is None:
+        return {}
+
+    with fp.open("r", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+
+    out: Dict[str, List[Dict]] = {}
+    for r in rows:
+        user = r.get("user")
+        buckets = r.get("r_bucket_precision")
+        if user is None or not isinstance(buckets, list):
+            continue
+        out[str(user)] = buckets
+    return out
+
+
+def _aggregate_r_bucket_precision(bucket_lists: List[List[Dict]]) -> List[Dict]:
+    acc: Dict[Tuple[float, float], Dict[str, float]] = {}
+
+    for buckets in bucket_lists:
+        for b in buckets:
+            try:
+                lo = float(b["bucket_start"])
+                hi = float(b["bucket_end"])
+                count = float(b["count"])
+                mse = float(b["mse_sec"]) if "mse_sec" in b else float("nan")
+                mae = float(b["mae_sec"])
+                precise = float(b["precise_enough_pct"])
+                mean_true = float(b["mean_true_sec"]) if "mean_true_sec" in b else float("nan")
+                mean_pred = float(b["mean_pred_sec"]) if "mean_pred_sec" in b else float("nan")
+                tol = float(b.get("tolerance_sec", 2.0))
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            k = (lo, hi)
+            if k not in acc:
+                acc[k] = {
+                    "count": 0.0,
+                    "mean_true_weighted_sum": 0.0,
+                    "mean_true_weight": 0.0,
+                    "mean_pred_weighted_sum": 0.0,
+                    "mean_pred_weight": 0.0,
+                    "mse_weighted_sum": 0.0,
+                    "mse_weight": 0.0,
+                    "mae_weighted_sum": 0.0,
+                    "precise_weighted_sum": 0.0,
+                    "tolerance_sec": tol,
+                }
+            acc[k]["count"] += count
+            if np.isfinite(mean_true):
+                acc[k]["mean_true_weighted_sum"] += mean_true * count
+                acc[k]["mean_true_weight"] += count
+            if np.isfinite(mean_pred):
+                acc[k]["mean_pred_weighted_sum"] += mean_pred * count
+                acc[k]["mean_pred_weight"] += count
+            if np.isfinite(mse):
+                acc[k]["mse_weighted_sum"] += mse * count
+                acc[k]["mse_weight"] += count
+            acc[k]["mae_weighted_sum"] += mae * count
+            acc[k]["precise_weighted_sum"] += precise * count
+
+    out: List[Dict] = []
+    for (lo, hi), v in sorted(acc.items(), key=lambda x: x[0][0]):
+        cnt = v["count"]
+        out.append(
+            {
+                "bucket_start": round(lo, 2),
+                "bucket_end": round(hi, 2),
+                "count": int(cnt),
+                "mean_true_sec": (
+                    round(v["mean_true_weighted_sum"] / v["mean_true_weight"], 6)
+                    if v["mean_true_weight"] > 0
+                    else None
+                ),
+                "mean_pred_sec": (
+                    round(v["mean_pred_weighted_sum"] / v["mean_pred_weight"], 6)
+                    if v["mean_pred_weight"] > 0
+                    else None
+                ),
+                "rmse_sec": (
+                    round(float(np.sqrt(v["mse_weighted_sum"] / v["mse_weight"])), 6)
+                    if v["mse_weight"] > 0
+                    else None
+                ),
+                "mae_sec": round(v["mae_weighted_sum"] / cnt, 6),
+                "precise_enough_pct": round(v["precise_weighted_sum"] / cnt, 6),
+                "tolerance_sec": float(v["tolerance_sec"]),
+            }
+        )
+    return out
+
+
+def _add_ratio_mapping_pct(
+    rows: List[Dict],
+    ref_bucket_start: float = 0.85,
+    ref_bucket_end: float = 0.90,
+) -> List[Dict]:
+    out = [dict(r) for r in rows]
+    ref_row = next(
+        (
+            r
+            for r in out
+            if np.isclose(float(r.get("bucket_start", -1.0)), ref_bucket_start)
+            and np.isclose(float(r.get("bucket_end", -1.0)), ref_bucket_end)
+        ),
+        None,
+    )
+    if ref_row is None:
+        for r in out:
+            r["ratio_mapping_pct"] = None
+            r["pred_ratio_to_ref"] = None
+            r["actual_ratio_to_ref"] = None
+        return out
+
+    ref_true = ref_row.get("mean_true_sec")
+    ref_pred = ref_row.get("mean_pred_sec")
+    if ref_true is None or ref_pred is None or float(ref_true) <= 0 or float(ref_pred) <= 0:
+        for r in out:
+            r["ratio_mapping_pct"] = None
+            r["pred_ratio_to_ref"] = None
+            r["actual_ratio_to_ref"] = None
+        return out
+
+    ref_true_f = float(ref_true)
+    ref_pred_f = float(ref_pred)
+    eps = 1e-12
+    for r in out:
+        bt = r.get("mean_true_sec")
+        bp = r.get("mean_pred_sec")
+        if bt is None or bp is None or float(bt) <= 0 or float(bp) <= 0:
+            r["ratio_mapping_pct"] = None
+            r["pred_ratio_to_ref"] = None
+            r["actual_ratio_to_ref"] = None
+            continue
+        pred_ratio = float(bp) / ref_pred_f
+        actual_ratio = float(bt) / ref_true_f
+        denom = max(pred_ratio, actual_ratio, eps)
+        mapping_pct = 100.0 * min(pred_ratio, actual_ratio) / denom
+        r["ratio_mapping_pct"] = round(mapping_pct, 6)
+        r["pred_ratio_to_ref"] = round(pred_ratio, 6)
+        r["actual_ratio_to_ref"] = round(actual_ratio, 6)
+    return out
+
+
+def _weighted_pearson(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> Optional[float]:
+    if len(x) < 2:
+        return None
+    sw = float(np.sum(w))
+    if sw <= 0:
+        return None
+    mx = float(np.sum(w * x) / sw)
+    my = float(np.sum(w * y) / sw)
+    dx = x - mx
+    dy = y - my
+    cov = float(np.sum(w * dx * dy) / sw)
+    vx = float(np.sum(w * dx * dx) / sw)
+    vy = float(np.sum(w * dy * dy) / sw)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / float(np.sqrt(vx * vy))
+
+
+def _bucket_corr_summary(rows: List[Dict]) -> Optional[Dict[str, float]]:
+    valid = [
+        r
+        for r in rows
+        if r.get("mean_true_sec") is not None and r.get("mean_pred_sec") is not None and int(r.get("count", 0)) > 0
+    ]
+    if len(valid) < 2:
+        return None
+
+    centers = np.array(
+        [(float(r["bucket_start"]) + float(r["bucket_end"])) / 2.0 for r in valid],
+        dtype=float,
+    )
+    mean_true = np.array([float(r["mean_true_sec"]) for r in valid], dtype=float)
+    mean_pred = np.array([float(r["mean_pred_sec"]) for r in valid], dtype=float)
+    weights = np.array([float(r["count"]) for r in valid], dtype=float)
+
+    pearson_true = _weighted_pearson(centers, mean_true, weights)
+    pearson_pred = _weighted_pearson(centers, mean_pred, weights)
+
+    # Rank-based correlation over bucket means (bucket-level Spearman proxy).
+    rank_x = np.argsort(np.argsort(centers)).astype(float)
+    rank_true = np.argsort(np.argsort(mean_true)).astype(float)
+    rank_pred = np.argsort(np.argsort(mean_pred)).astype(float)
+    spearman_true = _weighted_pearson(rank_x, rank_true, weights)
+    spearman_pred = _weighted_pearson(rank_x, rank_pred, weights)
+
+    return {
+        "pearson_true": float(pearson_true) if pearson_true is not None else float("nan"),
+        "pearson_pred": float(pearson_pred) if pearson_pred is not None else float("nan"),
+        "spearman_true": float(spearman_true) if spearman_true is not None else float("nan"),
+        "spearman_pred": float(spearman_pred) if spearman_pred is not None else float("nan"),
+    }
+
+
 def _metric_mean_ci(
     metrics_list: List[Dict], metric: str, weight_by: str
 ) -> Tuple[Optional[float], Optional[float]]:
@@ -345,6 +547,79 @@ def print_table_for_suffix(
     for line in _format_highlights(rows):
         print(line)
     print(_metric_interpretation_line())
+
+    r_bucket_by_method: Dict[str, Dict[str, List[Dict]]] = {}
+    for method in method_user_data.keys():
+        d = load_method_r_bucket_precision(method, result_dir, suffix_for_match)
+        if d:
+            r_bucket_by_method[method] = d
+
+    if r_bucket_by_method:
+        print("\nR-bucket precision (5% buckets):")
+        corr_rows: List[List[str]] = []
+        for method, by_user in r_bucket_by_method.items():
+            bucket_lists = [by_user[u] for u in common_users if u in by_user]
+            if not bucket_lists:
+                continue
+            agg = _aggregate_r_bucket_precision(bucket_lists)
+            if not agg:
+                continue
+            agg = _add_ratio_mapping_pct(agg, ref_bucket_start=0.85, ref_bucket_end=0.90)
+            corr = _bucket_corr_summary(agg)
+            if corr is not None:
+                corr_rows.append(
+                    [
+                        method,
+                        ("N/A" if not np.isfinite(corr["pearson_true"]) else f"{corr['pearson_true']:.4f}"),
+                        ("N/A" if not np.isfinite(corr["pearson_pred"]) else f"{corr['pearson_pred']:.4f}"),
+                        ("N/A" if not np.isfinite(corr["spearman_true"]) else f"{corr['spearman_true']:.4f}"),
+                        ("N/A" if not np.isfinite(corr["spearman_pred"]) else f"{corr['spearman_pred']:.4f}"),
+                    ]
+                )
+            tol = agg[0].get("tolerance_sec", 2.0)
+            print(f"\nMethod: {method} (Within 2s uses |pred-true| <= {tol:.1f}s)")
+            table_rows = [
+                [
+                    f"{b['bucket_start']:.2f}-{b['bucket_end']:.2f}",
+                    str(b["count"]),
+                    ("N/A" if b.get("mean_true_sec") is None else f"{float(b['mean_true_sec']):.4f}"),
+                    ("N/A" if b.get("mean_pred_sec") is None else f"{float(b['mean_pred_sec']):.4f}"),
+                    ("N/A" if b.get("rmse_sec") is None else f"{float(b['rmse_sec']):.4f}"),
+                    f"{b['mae_sec']:.4f}",
+                    ("N/A" if b.get("actual_ratio_to_ref") is None else f"{float(b['actual_ratio_to_ref']):.4f}"),
+                    ("N/A" if b.get("pred_ratio_to_ref") is None else f"{float(b['pred_ratio_to_ref']):.4f}"),
+                    ("N/A" if b.get("ratio_mapping_pct") is None else f"{float(b['ratio_mapping_pct']):.2f}"),
+                    f"{b['precise_enough_pct']:.2f}",
+                ]
+                for b in agg
+            ]
+            _print_aligned_markdown_table(
+                [
+                    "R bucket",
+                    "Count",
+                    "Mean true (s)",
+                    "Mean pred (s)",
+                    "RMSE (s)",
+                    "MAE (s)",
+                    "True ratio vs 0.85-0.90",
+                    "Pred ratio vs 0.85-0.90",
+                    "Ratio match (%)",
+                    "Within 2s (%)",
+                ],
+                table_rows,
+            )
+        if corr_rows:
+            print("\nR-time correlation summary (bucket-level, weighted by bucket count):")
+            _print_aligned_markdown_table(
+                [
+                    "Method",
+                    "Pearson R~true",
+                    "Pearson R~pred",
+                    "Spearman R~true",
+                    "Spearman R~pred",
+                ],
+                corr_rows,
+            )
 
 
 def main() -> None:

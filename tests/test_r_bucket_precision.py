@@ -15,6 +15,10 @@ class RBucketPrecisionTests(unittest.TestCase):
 
         b0 = next(x for x in out if x["bucket_start"] == 0.0 and x["bucket_end"] == 0.05)
         self.assertEqual(b0["count"], 2)
+        self.assertAlmostEqual(b0["mean_true_sec"], 10.0, places=6)
+        self.assertAlmostEqual(b0["mean_pred_sec"], 12.0, places=6)
+        self.assertAlmostEqual(b0["mse_sec"], 5.0, places=6)
+        self.assertAlmostEqual(b0["rmse_sec"], np.sqrt(5.0), places=6)
         self.assertAlmostEqual(b0["mae_sec"], 2.0, places=6)
         self.assertAlmostEqual(b0["precise_enough_pct"], 50.0, places=6)
 
