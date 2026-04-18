@@ -8,7 +8,12 @@ Methods:
 - grade_median_4_4
 - grade_median_8
 - fsrs_r_linear
+- fsrs_r_linear_by_grades
+- fsrs_r_ridge
 - fsrs_r_grade_interact
+- fsrs_one_minus_r_s_reps_d_linear
+- fsrs_one_minus_r_s_reps_d_linear_by_grade
+- fsrs_one_minus_r_s_reps_d_ridge
 - fsrs_dsr_grade_nn
 - poor_mans_fsrs
 - moving_avg
@@ -25,22 +30,23 @@ python script.py --method grade_median_4 --processes 1
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import traceback
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq  # type: ignore
 import torch
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
+from sklearn.linear_model import Ridge  # type: ignore
 from torch import Tensor, nn
 from tqdm.auto import tqdm  # type: ignore
 
@@ -57,9 +63,10 @@ from review_time_nn import (
 )
 
 try:
-    from scipy.optimize import curve_fit  # type: ignore
+    from scipy.optimize import curve_fit, minimize  # type: ignore
 except Exception:
     curve_fit = None
+    minimize = None
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -72,17 +79,27 @@ METHOD_NAMES = {
     "grade_median_4_4": "GRADE_MEDIAN_4_4",
     "grade_median_8": "GRADE_MEDIAN_8",  # identical to GRADE_MEDIAN_4 when --with_first_reviews is false
     "fsrs_r_linear": "FSRS7_R_LINEAR",
+    "fsrs_r_linear_by_grades": "FSRS7_R_LINEAR_BY_GRADES",
+    "fsrs_r_ridge": "FSRS7_R_RIDGE",
     "fsrs_r_grade_interact": "FSRS7_R_GRADE_INTERACT",
+    "fsrs_one_minus_r_s_reps_d_linear": "FSRS7_ONE_MINUS_R_S_REPS_D_LINEAR",
+    "fsrs_one_minus_r_s_reps_d_linear_by_grade": "FSRS7_ONE_MINUS_R_S_REPS_D_LINEAR_BY_GRADE",
+    "fsrs_one_minus_r_s_reps_d_ridge": "FSRS7_ONE_MINUS_R_S_REPS_D_RIDGE",
     "fsrs_dsr_grade_nn": "FSRS7_DSR_GRADE_NN",
     "poor_mans_fsrs": "POOR_MANS_FSRS",
     "moving_avg": "MOVING_AVG",
 }
+
+ALL_METHODS = list(METHOD_NAMES.keys())
+R_BUCKET_STEP = 0.05
+R_PRECISION_TOLERANCE_SEC = 2.0
 
 
 @dataclass
 class Config:
     data_path: Path = Path("../anki-revlogs-10k")
     max_user_id: Optional[int] = None
+    user_id: Optional[int] = None
 
     method: str = "const"
 
@@ -98,6 +115,8 @@ class Config:
     moving_avg_init_value: Optional[float] = None
     moving_avg_log_space: bool = True
     moving_avg_min_seconds: float = 0.05
+    ridge_alpha: float = 1.0
+    linear_loss: str = "mae"
 
     include_short_term: bool = True
     two_buttons: bool = False
@@ -125,6 +144,8 @@ class Config:
     verbose_inadequate_data: bool = False
 
     num_processes: int = 1
+    cache_fsrs_weights: bool = True
+    fsrs_weights_cache_dir: Path = Path(".cache/fsrs_weights")
 
     def get_evaluation_file_name(self) -> str:
         suffix = "WITH_FIRST_REVIEWS" if self.with_first_reviews else "NO_FIRST_REVIEWS"
@@ -135,6 +156,7 @@ def build_config(args: argparse.Namespace) -> Config:
     return Config(
         data_path=Path(args.data),
         max_user_id=args.max_user_id,
+        user_id=args.user_id,
         method=args.method,
         batch_size=args.batch_size,
         n_splits=args.n_splits,
@@ -160,6 +182,10 @@ def build_config(args: argparse.Namespace) -> Config:
         moving_avg_init_value=args.moving_avg_init_value,
         moving_avg_log_space=(not args.moving_avg_linear_space),
         moving_avg_min_seconds=args.moving_avg_min_seconds,
+        ridge_alpha=args.ridge_alpha,
+        linear_loss=args.linear_loss,
+        cache_fsrs_weights=(not args.no_cache_fsrs_weights),
+        fsrs_weights_cache_dir=Path(args.fsrs_weights_cache_dir),
     )
 
 
@@ -514,6 +540,36 @@ def _fit_ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     return coef
 
 
+def _fit_linear(X: np.ndarray, y: np.ndarray, loss: str) -> np.ndarray:
+    if loss == "mse":
+        return _fit_ols(X, y)
+
+    if loss != "mae":
+        raise ValueError(f"Unknown linear fit loss: {loss}")
+
+    init = _fit_ols(X, y)
+    if minimize is None:
+        return init
+
+    def objective(coef: np.ndarray) -> float:
+        pred = X @ coef
+        return float(np.mean(np.abs(pred - y)))
+
+    try:
+        result = minimize(
+            objective,
+            x0=init,
+            method="Powell",
+            options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 400},
+        )
+    except Exception:
+        return init
+
+    if not getattr(result, "success", False) or result.x.shape != init.shape:
+        return init
+    return np.asarray(result.x, dtype=float)
+
+
 def _poor_mans_fsrs_model(
     xdata: np.ndarray,
     a0: float,
@@ -646,15 +702,64 @@ def _fit_algorithm_weights(train_algorithm_df: pd.DataFrame, config: Config) -> 
         raise
 
 
+def _fit_algorithm_weights_cached(
+    train_algorithm_df: pd.DataFrame,
+    config: Config,
+    user_id: int,
+    split_key: int,
+) -> list:
+    if not config.cache_fsrs_weights:
+        return _fit_algorithm_weights(train_algorithm_df, config)
+
+    cache_dir = config.fsrs_weights_cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    event_min = int(train_algorithm_df["event_id"].min()) if len(train_algorithm_df) > 0 else -1
+    event_max = int(train_algorithm_df["event_id"].max()) if len(train_algorithm_df) > 0 else -1
+    cache_payload = {
+        "user_id": int(user_id),
+        "split_key": int(split_key),
+        "data_path": str(config.data_path),
+        "default_params": bool(config.default_params),
+        "use_recency_weighting": bool(config.use_recency_weighting),
+        "batch_size": int(config.batch_size),
+        "max_seq_len": int(config.max_seq_len),
+        "seed": int(config.seed),
+        "s_min": float(config.s_min),
+        "init_s_max": float(config.init_s_max),
+        "train_rows": int(len(train_algorithm_df)),
+        "event_min": event_min,
+        "event_max": event_max,
+    }
+    cache_key = hashlib.sha1(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    cache_file = cache_dir / f"fsrs_weights_{cache_key}.json"
+
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and len(cached) > 0:
+                return [float(x) for x in cached]
+        except Exception:
+            pass
+
+    w = _fit_algorithm_weights(train_algorithm_df, config)
+    try:
+        cache_file.write_text(json.dumps([float(x) for x in w]), encoding="utf-8")
+    except Exception:
+        pass
+    return w
+
+
 def _predict_DSR_maps(
     train_algorithm_df: pd.DataFrame,
     test_algorithm_df: pd.DataFrame,
     config: Config,
+    user_id: int,
+    split_key: int,
 ) -> tuple[dict[int, tuple[float, float, float]], dict[int, tuple[float, float, float]]]:
     if len(train_algorithm_df) == 0:
         return {}, {}
 
-    w = _fit_algorithm_weights(train_algorithm_df, config)
+    w = _fit_algorithm_weights_cached(train_algorithm_df, config, user_id=user_id, split_key=split_key)
     algorithm = FSRS7(config, w=w).to(config.device)
 
     train_map: dict[int, tuple[float, float, float]] = {}
@@ -677,11 +782,13 @@ def _predict_R_maps(
     train_algorithm_df: pd.DataFrame,
     test_algorithm_df: pd.DataFrame,
     config: Config,
+    user_id: int,
+    split_key: int,
 ) -> tuple[dict[int, float], dict[int, float], list]:
     if len(train_algorithm_df) == 0:
         return {}, {}, FSRS7(config).state_dict()
 
-    w = _fit_algorithm_weights(train_algorithm_df, config)
+    w = _fit_algorithm_weights_cached(train_algorithm_df, config, user_id=user_id, split_key=split_key)
     algorithm = FSRS7(config, w=w).to(config.device)
 
     train_map: dict[int, float] = {}
@@ -706,7 +813,9 @@ def _predict_fsrs_r_linear(
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
     with_first_reviews: bool,
-) -> np.ndarray:
+    linear_loss: str = "mae",
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
     global_med = float(scope_df["duration_sec"].median())
     by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
@@ -721,7 +830,7 @@ def _predict_fsrs_r_linear(
     if len(fit_df) >= 2:
         X = np.column_stack([fit_df["R"].to_numpy(), np.ones(len(fit_df))])
         y = fit_df["duration_sec"].to_numpy()
-        a, b = _fit_ols(X, y)
+        a, b = _fit_linear(X, y, loss=linear_loss)
     else:
         a, b = 0.0, global_med
 
@@ -737,7 +846,118 @@ def _predict_fsrs_r_linear(
             R = test_R_map.get(int(row["event_id"]))
             t = non_first_map[g] if R is None else float(a) * float(R) + float(b)
         pred.append(max(0.0, float(t)))
-    return np.array(pred, dtype=float)
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        return pred_arr, {"a": float(a), "b": float(b)}
+    return pred_arr
+
+
+def _predict_fsrs_r_ridge(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_R_map: dict[int, float],
+    test_R_map: dict[int, float],
+    with_first_reviews: bool,
+    ridge_alpha: float,
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["R"] = non_first_df["event_id"].map(train_R_map)
+    fit_df = non_first_df.dropna(subset=["R"]).copy()
+
+    if len(fit_df) >= 2:
+        X = fit_df["R"].to_numpy(dtype=float).reshape(-1, 1)
+        y = fit_df["duration_sec"].to_numpy(dtype=float)
+        model = Ridge(alpha=float(ridge_alpha), fit_intercept=True)
+        model.fit(X, y)
+        a = float(model.coef_[0])
+        b = float(model.intercept_)
+    else:
+        a, b = 0.0, global_med
+
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            R = test_R_map.get(int(row["event_id"]))
+            t = non_first_map[g] if R is None else float(a) * float(R) + float(b)
+        pred.append(max(0.0, float(t)))
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        return pred_arr, {"a": float(a), "b": float(b), "ridge_alpha": float(ridge_alpha)}
+    return pred_arr
+
+
+def _predict_fsrs_r_linear_by_grades(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_R_map: dict[int, float],
+    test_R_map: dict[int, float],
+    with_first_reviews: bool,
+    linear_loss: str = "mae",
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
+    grade_labels = {1: "again", 2: "hard", 3: "good", 4: "easy"}
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["R"] = non_first_df["event_id"].map(train_R_map)
+    fit_df = non_first_df.dropna(subset=["R"]).copy()
+
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    coeffs_by_grade: dict[int, tuple[float, float]] = {}
+    for g in [1, 2, 3, 4]:
+        gdf = fit_df[fit_df["rating"] == g]
+        if len(gdf) >= 2:
+            X = np.column_stack([gdf["R"].to_numpy(dtype=float), np.ones(len(gdf))])
+            y = gdf["duration_sec"].to_numpy(dtype=float)
+            a, b = _fit_linear(X, y, loss=linear_loss)
+        else:
+            a, b = 0.0, non_first_map[g]
+        coeffs_by_grade[g] = (float(a), float(b))
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            R = test_R_map.get(int(row["event_id"]))
+            if R is None:
+                t = non_first_map[g]
+            else:
+                a_g, b_g = coeffs_by_grade[g]
+                t = float(a_g) * float(R) + float(b_g)
+        pred.append(max(0.0, float(t)))
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        flat: dict[str, float] = {}
+        for g in [1, 2, 3, 4]:
+            a_g, b_g = coeffs_by_grade[g]
+            label = grade_labels[g]
+            flat[f"{label}_a"] = float(a_g)
+            flat[f"{label}_b"] = float(b_g)
+        return pred_arr, flat
+    return pred_arr
 
 
 def _predict_fsrs_r_grade_interact(
@@ -746,6 +966,7 @@ def _predict_fsrs_r_grade_interact(
     train_R_map: dict[int, float],
     test_R_map: dict[int, float],
     with_first_reviews: bool,
+    linear_loss: str = "mae",
 ) -> np.ndarray:
     scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
     global_med = float(scope_df["duration_sec"].median())
@@ -763,7 +984,7 @@ def _predict_fsrs_r_grade_interact(
         R = fit_df["R"].to_numpy().astype(float)
         X = np.column_stack([np.ones(len(fit_df)), g, R, g * R])
         y = fit_df["duration_sec"].to_numpy()
-        a0, a1, a2, a3 = _fit_ols(X, y)
+        a0, a1, a2, a3 = _fit_linear(X, y, loss=linear_loss)
     else:
         a0, a1, a2, a3 = global_med, 0.0, 0.0, 0.0
 
@@ -785,7 +1006,201 @@ def _predict_fsrs_r_grade_interact(
     return np.array(pred, dtype=float)
 
 
-def _list_user_ids(data_path: Path, max_user_id: Optional[int]) -> list[int]:
+def _predict_fsrs_one_minus_r_s_reps_d_linear(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_dsr_map: dict[int, tuple[float, float, float]],
+    test_dsr_map: dict[int, tuple[float, float, float]],
+    with_first_reviews: bool,
+    linear_loss: str = "mae",
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["dsr"] = non_first_df["event_id"].map(train_dsr_map)
+    fit_df = non_first_df.dropna(subset=["dsr"]).copy()
+
+    if len(fit_df) >= 5:
+        R = np.array([x[2] for x in fit_df["dsr"].tolist()], dtype=float)
+        S = np.array([x[1] for x in fit_df["dsr"].tolist()], dtype=float)
+        D = np.array([x[0] for x in fit_df["dsr"].tolist()], dtype=float)
+        reps = pd.to_numeric(fit_df["total_reps_before"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        y = fit_df["duration_sec"].to_numpy(dtype=float)
+        X = np.column_stack([np.ones(len(fit_df)), 1.0 - R, S, reps, D])
+        a, b, c, d, e = _fit_linear(X, y, loss=linear_loss)
+    else:
+        a, b, c, d, e = global_med, 0.0, 0.0, 0.0, 0.0
+
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g_: float(non_first_map_raw.get(g_, by_grade_all[g_])) for g_ in [1, 2, 3, 4]}
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            dsr = test_dsr_map.get(int(row["event_id"]))
+            if dsr is None:
+                t = non_first_map[g]
+            else:
+                D, S, R = float(dsr[0]), float(dsr[1]), float(dsr[2])
+                reps = float(pd.to_numeric(row.get("total_reps_before", 0.0), errors="coerce"))
+                if not np.isfinite(reps):
+                    reps = 0.0
+                t = float(a) + float(b) * (1.0 - R) + float(c) * S + float(d) * reps + float(e) * D
+        pred.append(max(0.0, float(t)))
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        return pred_arr, {"a": float(a), "b": float(b), "c": float(c), "d": float(d), "e": float(e)}
+    return pred_arr
+
+
+def _predict_fsrs_one_minus_r_s_reps_d_ridge(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_dsr_map: dict[int, tuple[float, float, float]],
+    test_dsr_map: dict[int, tuple[float, float, float]],
+    with_first_reviews: bool,
+    ridge_alpha: float,
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["dsr"] = non_first_df["event_id"].map(train_dsr_map)
+    fit_df = non_first_df.dropna(subset=["dsr"]).copy()
+
+    if len(fit_df) >= 5:
+        R = np.array([x[2] for x in fit_df["dsr"].tolist()], dtype=float)
+        S = np.array([x[1] for x in fit_df["dsr"].tolist()], dtype=float)
+        D = np.array([x[0] for x in fit_df["dsr"].tolist()], dtype=float)
+        reps = pd.to_numeric(fit_df["total_reps_before"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        y = fit_df["duration_sec"].to_numpy(dtype=float)
+        X = np.column_stack([1.0 - R, S, reps, D])
+        model = Ridge(alpha=float(ridge_alpha), fit_intercept=True)
+        model.fit(X, y)
+        b, c, d, e = [float(x) for x in model.coef_.tolist()]
+        a = float(model.intercept_)
+    else:
+        a, b, c, d, e = global_med, 0.0, 0.0, 0.0, 0.0
+
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g_: float(non_first_map_raw.get(g_, by_grade_all[g_])) for g_ in [1, 2, 3, 4]}
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            dsr = test_dsr_map.get(int(row["event_id"]))
+            if dsr is None:
+                t = non_first_map[g]
+            else:
+                D_, S_, R_ = float(dsr[0]), float(dsr[1]), float(dsr[2])
+                reps = float(pd.to_numeric(row.get("total_reps_before", 0.0), errors="coerce"))
+                if not np.isfinite(reps):
+                    reps = 0.0
+                t = float(a) + float(b) * (1.0 - R_) + float(c) * S_ + float(d) * reps + float(e) * D_
+        pred.append(max(0.0, float(t)))
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        return pred_arr, {
+            "a": float(a),
+            "b": float(b),
+            "c": float(c),
+            "d": float(d),
+            "e": float(e),
+            "ridge_alpha": float(ridge_alpha),
+        }
+    return pred_arr
+
+
+def _predict_fsrs_one_minus_r_s_reps_d_linear_by_grade(
+    train_eval: pd.DataFrame,
+    test_eval: pd.DataFrame,
+    train_dsr_map: dict[int, tuple[float, float, float]],
+    test_dsr_map: dict[int, tuple[float, float, float]],
+    with_first_reviews: bool,
+    linear_loss: str = "mae",
+    return_coefficients: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+    scope_df = _duration_training_scope(train_eval, with_first_reviews=with_first_reviews)
+    global_med = float(scope_df["duration_sec"].median())
+    by_grade_all = _fill_grade_medians(_median_by_grade(scope_df), global_med)
+    grade_labels = {1: "again", 2: "hard", 3: "good", 4: "easy"}
+
+    first_map_raw = train_eval[train_eval["first_review"]].groupby("rating")["duration_sec"].median().to_dict()
+    first_map = {g: float(first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    non_first_df = train_eval[~train_eval["first_review"]].copy()
+    non_first_df["dsr"] = non_first_df["event_id"].map(train_dsr_map)
+    fit_df = non_first_df.dropna(subset=["dsr"]).copy()
+
+    non_first_map_raw = non_first_df.groupby("rating")["duration_sec"].median().to_dict()
+    non_first_map = {g: float(non_first_map_raw.get(g, by_grade_all[g])) for g in [1, 2, 3, 4]}
+
+    coeffs_by_grade: dict[int, tuple[float, float, float, float, float]] = {}
+    for g in [1, 2, 3, 4]:
+        gdf = fit_df[fit_df["rating"] == g].copy()
+        if len(gdf) >= 5:
+            R = np.array([x[2] for x in gdf["dsr"].tolist()], dtype=float)
+            S = np.array([x[1] for x in gdf["dsr"].tolist()], dtype=float)
+            D = np.array([x[0] for x in gdf["dsr"].tolist()], dtype=float)
+            reps = pd.to_numeric(gdf["total_reps_before"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            y = gdf["duration_sec"].to_numpy(dtype=float)
+            X = np.column_stack([np.ones(len(gdf)), 1.0 - R, S, reps, D])
+            a, b, c, d, e = _fit_linear(X, y, loss=linear_loss)
+        else:
+            a, b, c, d, e = non_first_map[g], 0.0, 0.0, 0.0, 0.0
+        coeffs_by_grade[g] = (float(a), float(b), float(c), float(d), float(e))
+
+    pred = []
+    for _, row in test_eval.iterrows():
+        g = int(row["rating"])
+        if bool(row["first_review"]):
+            t = first_map[g]
+        else:
+            dsr = test_dsr_map.get(int(row["event_id"]))
+            if dsr is None:
+                t = non_first_map[g]
+            else:
+                D_, S_, R_ = float(dsr[0]), float(dsr[1]), float(dsr[2])
+                reps = float(pd.to_numeric(row.get("total_reps_before", 0.0), errors="coerce"))
+                if not np.isfinite(reps):
+                    reps = 0.0
+                a_g, b_g, c_g, d_g, e_g = coeffs_by_grade[g]
+                t = float(a_g) + float(b_g) * (1.0 - R_) + float(c_g) * S_ + float(d_g) * reps + float(e_g) * D_
+        pred.append(max(0.0, float(t)))
+
+    pred_arr = np.array(pred, dtype=float)
+    if return_coefficients:
+        flat: dict[str, float] = {}
+        for g in [1, 2, 3, 4]:
+            label = grade_labels[g]
+            a_g, b_g, c_g, d_g, e_g = coeffs_by_grade[g]
+            flat[f"{label}_a"] = float(a_g)
+            flat[f"{label}_b"] = float(b_g)
+            flat[f"{label}_c"] = float(c_g)
+            flat[f"{label}_d"] = float(d_g)
+            flat[f"{label}_e"] = float(e_g)
+        return pred_arr, flat
+    return pred_arr
+
+
+def _list_user_ids(data_path: Path, max_user_id: Optional[int], user_id: Optional[int]) -> list[int]:
     ids = []
     for p in (data_path / "revlogs").glob("user_id=*"):
         try:
@@ -793,13 +1208,20 @@ def _list_user_ids(data_path: Path, max_user_id: Optional[int]) -> list[int]:
         except Exception:
             continue
     ids = sorted(set(ids))
-    if max_user_id is not None:
+    if user_id is not None:
+        ids = [u for u in ids if u == user_id]
+    elif max_user_id is not None:
         ids = [u for u in ids if u <= max_user_id]
     return ids
 
 
+def _resolve_unprocessed_user_ids(config: Config, processed_users: set[int]) -> list[int]:
+    all_user_ids = _list_user_ids(config.data_path, config.max_user_id, config.user_id)
+    return [uid for uid in all_user_ids if uid not in processed_users]
+
+
 def _build_pretrain_nn_state(config: Config) -> dict:
-    user_ids = _list_user_ids(config.data_path, config.max_user_id)[: config.nn_pretrain_users]
+    user_ids = _list_user_ids(config.data_path, config.max_user_id, config.user_id)[: config.nn_pretrain_users]
 
     X_all: list[np.ndarray] = []
     y_all: list[np.ndarray] = []
@@ -873,7 +1295,13 @@ def _load_or_pretrain_nn_state(config: Config) -> dict:
 
     if ckpt.exists():
         tqdm.write(f"Found pretrained checkpoint: {ckpt}")
-        state = torch.load(ckpt, map_location="cpu")
+        try:
+            # PyTorch >=2.6 defaults to weights_only=True, but this checkpoint also
+            # stores numpy arrays (normalizer stats), so we need full unpickling.
+            state = torch.load(ckpt, map_location="cpu", weights_only=False)
+        except TypeError:
+            # Compatibility for older PyTorch versions without `weights_only`.
+            state = torch.load(ckpt, map_location="cpu")
         if not isinstance(state, dict) or "state_dict" not in state or "norm_mean" not in state or "norm_std" not in state:
             raise RuntimeError(f"Checkpoint format invalid: {ckpt}")
         tqdm.write("Loaded pretrained NN; skipping pretraining.")
@@ -972,12 +1400,70 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"MAE": round(mae, 6), "RMSE": round(rmse, 6), "MAPE": None if mape is None else round(mape, 6)}
 
 
+def _compute_r_bucket_precision(
+    r_values: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    bucket_step: float = R_BUCKET_STEP,
+    tolerance_sec: float = R_PRECISION_TOLERANCE_SEC,
+) -> list[dict]:
+    r = np.asarray(r_values, dtype=float)
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+
+    mask = np.isfinite(r) & np.isfinite(y) & np.isfinite(p)
+    r = r[mask]
+    y = y[mask]
+    p = p[mask]
+    if len(r) == 0:
+        return []
+
+    edges = np.arange(0.0, 1.0 + bucket_step + 1e-12, bucket_step)
+    edges[-1] = 1.0
+    out: list[dict] = []
+
+    abs_err = np.abs(p - y)
+
+    for i in range(len(edges) - 1):
+        lo = float(edges[i])
+        hi = float(edges[i + 1])
+        if i == len(edges) - 2:
+            in_bucket = (r >= lo) & (r <= hi)
+        else:
+            in_bucket = (r >= lo) & (r < hi)
+        if not np.any(in_bucket):
+            continue
+
+        bucket_err = abs_err[in_bucket]
+        bucket_sq_err = np.square(p[in_bucket] - y[in_bucket])
+        bucket_true = y[in_bucket]
+        bucket_pred = p[in_bucket]
+        precise_pct = float(np.mean(bucket_err <= tolerance_sec) * 100.0)
+        out.append(
+            {
+                "bucket_start": round(lo, 2),
+                "bucket_end": round(hi, 2),
+                "count": int(np.sum(in_bucket)),
+                "mean_true_sec": round(float(np.mean(bucket_true)), 6),
+                "mean_pred_sec": round(float(np.mean(bucket_pred)), 6),
+                "mse_sec": round(float(np.mean(bucket_sq_err)), 6),
+                "rmse_sec": round(float(np.sqrt(np.mean(bucket_sq_err))), 6),
+                "mae_sec": round(float(np.mean(bucket_err)), 6),
+                "precise_enough_pct": round(precise_pct, 6),
+                "tolerance_sec": float(tolerance_sec),
+            }
+        )
+    return out
+
+
 def evaluate(
     y_true: list[float],
     y_pred: list[float],
     user_id: int,
     config: Config,
     algorithm_weights_last_split: Optional[list] = None,
+    regression_parameters_last_split: Optional[dict[str, float]] = None,
+    r_bucket_precision: Optional[list[dict]] = None,
 ) -> tuple[dict, Optional[dict]]:
     y = np.array(y_true, dtype=float)
     p = np.array(y_pred, dtype=float)
@@ -993,6 +1479,14 @@ def evaluate(
             stats["algorithm_parameters"] = [round(float(x), 6) for x in algorithm_weights_last_split]
         else:
             stats["algorithm_parameters"] = algorithm_weights_last_split
+
+    if config.save_weights and regression_parameters_last_split is not None:
+        stats["regression_parameters"] = {
+            k: round(float(v), 6) for k, v in regression_parameters_last_split.items()
+        }
+
+    if r_bucket_precision is not None:
+        stats["r_bucket_precision"] = r_bucket_precision
 
     raw: Optional[dict] = None
     if config.save_raw_output:
@@ -1111,6 +1605,22 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         if len(metric_df) == 0:
             raise Exception(f"{user_id}: no evaluation rows after filtering by with_first_reviews={config.with_first_reviews}.")
 
+        # Build a reference R-map so moving_avg can also report R-bucket precision.
+        _, test_R_map, _ = _predict_R_maps(
+            train_algorithm_df=algorithm_df,
+            test_algorithm_df=algorithm_df,
+            config=config,
+            user_id=user_id,
+            split_key=int(eval_df["event_id"].max()) if len(eval_df) > 0 else -1,
+        )
+        metric_df = metric_df.copy()
+        metric_df["R"] = metric_df["event_id"].map(test_R_map)
+        r_bucket_precision = _compute_r_bucket_precision(
+            r_values=pd.to_numeric(metric_df["R"], errors="coerce").to_numpy(dtype=float),
+            y_true=metric_df["t_true"].astype(float).to_numpy(dtype=float),
+            y_pred=metric_df["t_pred"].astype(float).to_numpy(dtype=float),
+        )
+
         save_evaluation_file(user_id, save_df, config)
         return evaluate(
             metric_df["t_true"].astype(float).tolist(),
@@ -1118,6 +1628,7 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
             user_id,
             config,
             None,
+            r_bucket_precision=r_bucket_precision,
         )
 
     if not config.with_first_reviews and (~eval_df["first_review"]).sum() == 0:
@@ -1128,6 +1639,8 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
     p_all: list[float] = []
     save_tmp: list[pd.DataFrame] = []
     last_algorithm_weights: Optional[list] = None
+    last_regression_parameters: Optional[dict[str, float]] = None
+    last_r_bucket_precision: Optional[list[dict]] = None
 
     method_always_excludes_first = config.method == "grade_median_4_4"
 
@@ -1150,6 +1663,15 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
 
         test_event_ids = set(test_eval["event_id"].tolist())
         test_algorithm_df = algorithm_df[algorithm_df["event_id"].isin(test_event_ids)].copy()
+        train_R_map, test_R_map, r_weights = _predict_R_maps(
+            train_algorithm_df,
+            test_algorithm_df,
+            config,
+            user_id=user_id,
+            split_key=first_test_event,
+        )
+        test_eval = test_eval.copy()
+        test_eval["R"] = test_eval["event_id"].map(test_R_map)
 
         if config.method == "const":
             pred = _predict_const7(test_eval)
@@ -1173,17 +1695,53 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                 with_first_reviews=config.with_first_reviews,
             )
 
-        elif config.method in ("fsrs_r_linear", "fsrs_r_grade_interact"):
-            train_R_map, test_R_map, weights = _predict_R_maps(train_algorithm_df, test_algorithm_df, config)
-            last_algorithm_weights = weights if weights else last_algorithm_weights
+        elif config.method in ("fsrs_r_linear", "fsrs_r_linear_by_grades", "fsrs_r_ridge", "fsrs_r_grade_interact"):
+            last_algorithm_weights = r_weights if r_weights else last_algorithm_weights
             if config.method == "fsrs_r_linear":
-                pred = _predict_fsrs_r_linear(
+                linear_out = _predict_fsrs_r_linear(
                     train_eval,
                     test_eval,
                     train_R_map,
                     test_R_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
+                    return_coefficients=config.save_weights,
                 )
+                if config.save_weights:
+                    pred, coeffs = linear_out  # type: ignore[assignment]
+                    last_regression_parameters = coeffs
+                else:
+                    pred = linear_out  # type: ignore[assignment]
+            elif config.method == "fsrs_r_linear_by_grades":
+                linear_out = _predict_fsrs_r_linear_by_grades(
+                    train_eval,
+                    test_eval,
+                    train_R_map,
+                    test_R_map,
+                    with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
+                    return_coefficients=config.save_weights,
+                )
+                if config.save_weights:
+                    pred, coeffs = linear_out  # type: ignore[assignment]
+                    last_regression_parameters = coeffs
+                else:
+                    pred = linear_out  # type: ignore[assignment]
+            elif config.method == "fsrs_r_ridge":
+                linear_out = _predict_fsrs_r_ridge(
+                    train_eval,
+                    test_eval,
+                    train_R_map,
+                    test_R_map,
+                    with_first_reviews=config.with_first_reviews,
+                    ridge_alpha=config.ridge_alpha,
+                    return_coefficients=config.save_weights,
+                )
+                if config.save_weights:
+                    pred, coeffs = linear_out  # type: ignore[assignment]
+                    last_regression_parameters = coeffs
+                else:
+                    pred = linear_out  # type: ignore[assignment]
             else:
                 pred = _predict_fsrs_r_grade_interact(
                     train_eval,
@@ -1191,12 +1749,67 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
                     train_R_map,
                     test_R_map,
                     with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
                 )
+
+        elif config.method in (
+            "fsrs_one_minus_r_s_reps_d_linear",
+            "fsrs_one_minus_r_s_reps_d_linear_by_grade",
+            "fsrs_one_minus_r_s_reps_d_ridge",
+        ):
+            train_dsr_map, test_dsr_map = _predict_DSR_maps(
+                train_algorithm_df,
+                test_algorithm_df,
+                config,
+                user_id=user_id,
+                split_key=first_test_event,
+            )
+            if config.method == "fsrs_one_minus_r_s_reps_d_linear":
+                linear_out = _predict_fsrs_one_minus_r_s_reps_d_linear(
+                    train_eval=train_eval,
+                    test_eval=test_eval,
+                    train_dsr_map=train_dsr_map,
+                    test_dsr_map=test_dsr_map,
+                    with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
+                    return_coefficients=config.save_weights,
+                )
+            elif config.method == "fsrs_one_minus_r_s_reps_d_linear_by_grade":
+                linear_out = _predict_fsrs_one_minus_r_s_reps_d_linear_by_grade(
+                    train_eval=train_eval,
+                    test_eval=test_eval,
+                    train_dsr_map=train_dsr_map,
+                    test_dsr_map=test_dsr_map,
+                    with_first_reviews=config.with_first_reviews,
+                    linear_loss=config.linear_loss,
+                    return_coefficients=config.save_weights,
+                )
+            else:
+                linear_out = _predict_fsrs_one_minus_r_s_reps_d_ridge(
+                    train_eval=train_eval,
+                    test_eval=test_eval,
+                    train_dsr_map=train_dsr_map,
+                    test_dsr_map=test_dsr_map,
+                    with_first_reviews=config.with_first_reviews,
+                    ridge_alpha=config.ridge_alpha,
+                    return_coefficients=config.save_weights,
+                )
+            if config.save_weights:
+                pred, coeffs = linear_out  # type: ignore[assignment]
+                last_regression_parameters = coeffs
+            else:
+                pred = linear_out  # type: ignore[assignment]
 
         elif config.method == "fsrs_dsr_grade_nn":
             if nn_state is None:
                 raise RuntimeError("NN state is required for fsrs_dsr_grade_nn but is None.")
-            train_dsr_map, test_dsr_map = _predict_DSR_maps(train_algorithm_df, test_algorithm_df, config)
+            train_dsr_map, test_dsr_map = _predict_DSR_maps(
+                train_algorithm_df,
+                test_algorithm_df,
+                config,
+                user_id=user_id,
+                split_key=first_test_event,
+            )
             pred = _predict_fsrs_dsr_grade_nn(
                 train_eval=train_eval,
                 test_eval=test_eval,
@@ -1241,14 +1854,32 @@ def process(user_id: int, config: Config, nn_state: Optional[dict] = None) -> tu
         raise Exception(f"{user_id}: no evaluation rows after filtering by with_first_reviews={config.with_first_reviews}.")
 
     save_df = pd.concat(save_tmp, ignore_index=True)
+    metric_rows = save_df[save_df["used_for_metrics"]].copy()
+    if "R" in metric_rows.columns:
+        last_r_bucket_precision = _compute_r_bucket_precision(
+            r_values=pd.to_numeric(metric_rows["R"], errors="coerce").to_numpy(dtype=float),
+            y_true=metric_rows["t_true"].to_numpy(dtype=float),
+            y_pred=metric_rows["t_pred"].to_numpy(dtype=float),
+        )
     save_evaluation_file(user_id, save_df, config)
-    return evaluate(y_all, p_all, user_id, config, last_algorithm_weights)
+    return evaluate(
+        y_all,
+        p_all,
+        user_id,
+        config,
+        algorithm_weights_last_split=last_algorithm_weights,
+        regression_parameters_last_split=last_regression_parameters,
+        r_bucket_precision=last_r_bucket_precision,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Review-time benchmark")
     p.add_argument("--data", default="../anki-revlogs-10k")
     p.add_argument("--processes", type=int, default=1)
+    p.add_argument("--all-methods", action="store_true")
+    p.add_argument("--no-cache-fsrs-weights", action="store_true")
+    p.add_argument("--fsrs-weights-cache-dir", default=".cache/fsrs_weights")
 
     p.add_argument(
         "--method",
@@ -1262,7 +1893,12 @@ def _parse_args() -> argparse.Namespace:
             "poor_mans_fsrs",
             "moving_avg",
             "fsrs_r_linear",
+            "fsrs_r_linear_by_grades",
+            "fsrs_r_ridge",
             "fsrs_r_grade_interact",
+            "fsrs_one_minus_r_s_reps_d_linear",
+            "fsrs_one_minus_r_s_reps_d_linear_by_grade",
+            "fsrs_one_minus_r_s_reps_d_ridge",
             "fsrs_dsr_grade_nn",
         ],
     )
@@ -1271,6 +1907,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--moving_avg_init_value", type=float, default=None)
     p.add_argument("--moving_avg_linear_space", action="store_true")
     p.add_argument("--moving_avg_min_seconds", type=float, default=0.05)
+    p.add_argument("--linear-loss", dest="linear_loss", choices=["mse", "mae"], default="mae")
+    p.add_argument("--ridge-alpha", dest="ridge_alpha", type=float, default=1.0)
 
     p.add_argument("--batch-size", dest="batch_size", type=int, default=512)
     p.add_argument("--n-splits", dest="n_splits", type=int, default=5)
@@ -1283,6 +1921,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-weights", dest="save_weights", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--max-user-id", dest="max_user_id", type=int, default=None)
+    p.add_argument("--user-id", dest="user_id", type=int, default=None)
 
     p.add_argument("--nn_ckpt", type=str, default="checkpoints/review_time_pretrained.pth")
     p.add_argument("--nn_pretrain_users", type=int, default=250)
@@ -1297,13 +1936,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> None:
-    mp.set_start_method("spawn", force=True)
-    args = _parse_args()
-    config = build_config(args)
-    torch.manual_seed(config.seed)
-
-    dataset = pq.ParquetDataset(config.data_path / "revlogs")
+def _run_single_method(config: Config) -> None:
     file_name = config.get_evaluation_file_name()
 
     Path(f"evaluation/{file_name}").mkdir(parents=True, exist_ok=True)
@@ -1325,14 +1958,7 @@ def main() -> None:
     if config.save_raw_output and raw_file.exists():
         sort_jsonl(raw_file)
 
-    unprocessed = []
-    for user_id in dataset.partitioning.dictionaries[0]:
-        uid = user_id.as_py()
-        if config.max_user_id is not None and uid > config.max_user_id:
-            continue
-        if uid not in processed_users:
-            unprocessed.append(uid)
-    unprocessed.sort()
+    unprocessed = _resolve_unprocessed_user_ids(config, processed_users)
 
     global_nn_state: Optional[dict] = None
     if config.method == "fsrs_dsr_grade_nn":
@@ -1364,6 +1990,21 @@ def main() -> None:
     sort_jsonl(result_file)
     if config.save_raw_output and raw_file.exists():
         sort_jsonl(raw_file)
+
+
+def _resolve_methods_to_run(method: str, all_methods: bool) -> list[str]:
+    return ALL_METHODS.copy() if all_methods else [method]
+
+
+def main() -> None:
+    mp.set_start_method("spawn", force=True)
+    args = _parse_args()
+    base_config = build_config(args)
+    torch.manual_seed(base_config.seed)
+
+    for method in _resolve_methods_to_run(base_config.method, args.all_methods):
+        config = replace(base_config, method=method)
+        _run_single_method(config)
 
 
 if __name__ == "__main__":
