@@ -180,7 +180,7 @@ python3 calibration_plots.py --input results.txt --out-dir calibration_plots --g
 
 ## Result
 
-Total number of collections (each from one Anki user): 9,994.
+Total number of collections (each from one Anki user): ____.
 
 Total number of reviews for evaluation: _________.
 
