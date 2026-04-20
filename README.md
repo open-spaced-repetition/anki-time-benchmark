@@ -31,7 +31,7 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 8) fsrs_r_ridge: `t = b + a * R` with Ridge regularization.
 9) fsrs_r_linear_by_grades: `t = b_g + a_g * R`, two linear regression parameters per grade for a total of 8 parameters.
 10) fsrs_r_grade_interact: `t = a0 + a1 * G + a2 * R + a3 * G * R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
-11) fsrs_one_minus_r_s_reps_d_linear: `t = a + b * (1 - R) + c * S + d * reps + e * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
+11) fsrs_one_minus_r_s_reps_d_linear: `t = a0 + a1 * (1 - R) + a2 * S + a3 * reps + a4 * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
 12) fsrs_one_minus_r_s_reps_d_linear_by_grade: same as above, but fitted separately per grade.
 13) fsrs_one_minus_r_s_reps_d_ridge: same features as above, with Ridge regularization.
 14) fsrs_dsr_grade_nn: a simple feedforward neural network is used. It takes the grade and difficulty (D), stability (S), retrievability (R) from FSRS-7 as input. The neural network is first pretrained on 250 users, and then fine-tuned on each user individually. During fine-tuning only the last layer is optimized, to avoid overfitting, while other parameters remain frozen. This way it can learn the general pattern from 250 users while still being able to adapt to each user individually.
