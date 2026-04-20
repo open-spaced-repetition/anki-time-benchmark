@@ -22,15 +22,15 @@ We use three metrics in the time benchmark to evaluate how well these methods pe
 ### Methods
 
 1) const: a hard-coded constant time. Currently, 7 seconds is used.
-2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One number per user.
-3) grade_median_4: median time for Again/Hard/Good/Easy. 4 numbers per user.
-4) grade_median_4_4: same as above, but the previous grade also matters. For example, time for Again->Again is different from time for Again->Hard. 16 numbers per user.
-5) poor_mans_fsrs: `t=a0 + a1*ln(number of Agains) + a2*ln(total number of all reps) + a3*e^(-a4*interval length) + a5*G`. This is akin to using a very crude version of FSRS.
+2) user_median: median time. In this benchmark it's estimated from the train split and then used in the test split. One parameter per user.
+3) grade_median_4: median time for Again/Hard/Good/Easy. 4 parameters per user.
+4) grade_median_4_4: same as above, but the previous grade also matters. For example, time for Again->Again is different from time for Again->Hard. 16 parameters per user.
+5) poor_mans_fsrs: `t = a0 + a1 * ln(number of Agains) + a2 * ln(total number of all reps) + a3 * e^(-a4 * interval length) + a5 * G`. This is akin to using a very crude version of FSRS.
 6) moving_avg: [similar to the one used in the main benchmark](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/model_processors.py#L119-L157), it predicts time of the next review based on time of recent reviews. Interval lengths and grades don't matter. Roughly speaking, the idea is that if recent reviews took around 10 seconds, then the next review will probably also take around 10 seconds, and if recent reviews took 5 seconds, then the next review will probably also take around 5 seconds.
-7) fsrs_r_linear: `t=b + a*R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
-8) fsrs_r_ridge: `t=b + a*R` with Ridge regularization.
-9) fsrs_r_linear_by_grades: `t=b_g + a_g*R`, one linear regression per grade (`g in {Again, Hard, Good, Easy}`).
-10) fsrs_r_grade_interact: `t=a0 + a1*G + a2*R + a3*G*R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
+7) fsrs_r_linear: `t = b + a * R`. Here R is probability of recall predicted by FSRS-7. `a` and `b` are estimated based on each user's review history.
+8) fsrs_r_ridge: `t = b + a * R` with Ridge regularization.
+9) fsrs_r_linear_by_grades: `t = b_g + a_g * R`, two linear regression parameters per grade for a total of 8 parameters.
+10) fsrs_r_grade_interact: `t = a0 + a1 * G + a2 * R + a3 * G * R`, where G (grade) can take values 1, 2, 3, 4 for Again, Hard, Good and Easy respectively. `a0`, `a1`, `a2` and `a3` are estimated based on each user's review history.
 11) fsrs_one_minus_r_s_reps_d_linear: `t = a + b * (1 - R) + c * S + d * reps + e * D`, where `R`, `S`, and `D` come from FSRS-7 and `reps` is the number of previous reviews for the card. Coefficients are fitted per user from the train split.
 12) fsrs_one_minus_r_s_reps_d_linear_by_grade: same as above, but fitted separately per grade.
 13) fsrs_one_minus_r_s_reps_d_ridge: same features as above, with Ridge regularization.
